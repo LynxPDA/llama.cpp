@@ -110,6 +110,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         GGML_ASSERT(n_embd == h->ne[0]);
 
         ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+    } else {
+        // token-only batches (the startup seq_rm probe) carry no hidden state - zero it
+        // instead of leaving the graph input uninitialized
+        ggml_backend_tensor_memset(h, 0, 0, ggml_nbytes(h));
     }
 }
 
