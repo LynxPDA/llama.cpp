@@ -1094,10 +1094,45 @@ private:
                 uint32_t hp_ngl = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
+
+                // a metadata-only target for a draft that borrows its token embedding / LM head
+                // from the target model: sizing such a draft needs a ctx_other to borrow from,
+                // and the real target is not loaded yet at this point
+                llama_model *   model_meta = nullptr;
+                llama_context * ctx_meta   = nullptr;
+
+                auto measure = [&](llama_context * ctx_other) {
+                    cparams_dft.ctx_other = ctx_other;
+                    return common_get_device_memory_data(
                         params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
                         devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                };
+
+                try {
+                    common_device_memory_data_vec dmd;
+                    try {
+                        dmd = measure(nullptr);
+                    } catch (const std::exception & e) {
+                        if (!has_draft) {
+                            throw;
+                        }
+                        SRV_INF("[spec] draft model needs a target to size against (%s); retrying with a metadata-only target\n", e.what());
+
+                        llama_model_params mparams_meta = common_model_params_to_llama(params_base);
+                        mparams_meta.no_alloc  = true;
+                        mparams_meta.load_mode = LLAMA_LOAD_MODE_NONE;
+
+                        model_meta = llama_model_load_from_file(params_base.model.path.c_str(), mparams_meta);
+                        if (model_meta == nullptr) {
+                            throw std::runtime_error("failed to load the target model metadata");
+                        }
+                        llama_context_params cparams_meta = common_context_params_to_llama(params_base);
+                        ctx_meta = llama_init_from_model(model_meta, cparams_meta);
+                        if (ctx_meta == nullptr) {
+                            throw std::runtime_error("failed to create a metadata-only target context");
+                        }
+                        dmd = measure(ctx_meta);
+                    }
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
@@ -1128,6 +1163,13 @@ private:
                 } catch (const std::exception & e) {
                     SRV_WRN("[spec] failed to measure %s memory: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
+                }
+
+                if (ctx_meta) {
+                    llama_free(ctx_meta);
+                }
+                if (model_meta) {
+                    llama_model_free(model_meta);
                 }
             }
         }
