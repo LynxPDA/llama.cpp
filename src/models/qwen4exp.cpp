@@ -903,9 +903,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // the backend attend over the whole cache and merely discard what it read, which is O(n_kv)
     // per token; with top_k attached, a backend that can compact the active set (the Vulkan
     // gather-compact path) costs O(n_top_k) instead. n_kv_raw is 0: unlike DeepSeek V4 this
-    // cache has no dense prefix, every attended cell comes from the selection. Backends without
-    // that path ignore the extra argument and read the same mask they do today.
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il, top_k, 0);
+    // cache has no dense prefix, every attended cell comes from the selection. n_kv_max bounds
+    // the finite mask entries per row (the selection width) and drives the mask-compaction
+    // sparse path for prefill batches, which the fork's gather-compact path declines (N >= 64).
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il, top_k, 0);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
