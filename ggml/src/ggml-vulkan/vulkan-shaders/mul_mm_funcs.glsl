@@ -246,7 +246,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint b = (iqs % 32) / 16;            // 0,1
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
 
-#ifdef MMID_QK_SCACHE
+#ifdef MUL_MAT_ID
             // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
             const float d = scache_dm[col * 8 + 2 * n + b].x;
             const float m = scache_dm[col * 8 + 2 * n + b].y;
@@ -290,7 +290,7 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint qsi = n * 32 + (iqs % 16) * 2;  // 0,2,4..126
             const uint qhi = (iqs % 16) * 2;           // 0,2,4..30
 
-#ifdef MMID_QK_SCACHE
+#ifdef MUL_MAT_ID
             // (d, m) precomputed per (tile row, sub-block) at superblock boundaries
             const float d = scache_dm[col * 8 + 2 * n + b].x;
             const float m = scache_dm[col * 8 + 2 * n + b].y;

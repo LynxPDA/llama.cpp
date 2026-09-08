@@ -142,10 +142,23 @@ shared FLOAT_TYPEV2 buf_b[BN * SHMEM_STRIDE];
 // packed 6-bit scale extraction can run once per row per superblock instead of
 // once per 4-weight load (8x redundant across the loading lanes). Both types
 // share the dm + scales[12] block prefix, so one fill serves both.
-// Disabled 2026-07-28: measured a pure loss on the current stack (Qwen3.6-35B Q5_K,
-// RADV gfx1151): -4% pp512@ub512, -20% pp2048@ub2048 vs the cache off; decode unaffected.
-// The July-14 win it was added for did not survive the later tile/rebase changes.
-#define MMID_QK_SCACHE 0
+// Always on for mul_mat_id; there is deliberately no toggle. It had one, and it
+// cost us a shipped correctness bug: the macro was set to 0 in July on a bad
+// measurement but every guard was #ifdef, so the cache stayed compiled in and that
+// is the state that shipped and was benchmarked for five weeks. 83f901d73 then put
+// one of the three guards on #if, which disabled the refill below while the two
+// readers in mul_mm_funcs.glsl kept reading scache_dm. Every q4_K/q5_K expert
+// weight was dequantized against a scale nothing wrote, and v0.7.4 emitted a single
+// repeated token on every MoE with q4_K/q5_K experts (reverted in 5d8c07b44).
+// Re-measured 2026-09-04 with the guard form held constant across both arms:
+// 3 models x {pp512@ub512, pp2048@ub2048} x {d0, d16384}, 3 launches per arm. The
+// cache wins or ties 12 of 12 cells and loses none - +5 to +8% at ub512, neutral to
+// +2% at ub2048, holding at depth, on Qwen3.6-35B UD-Q5_K_XL / UD-Q4_K_XL and
+// Ornith-1.5-35B Q4_K_M. The 2026-07-28 number has its sign inverted at ub512 and
+// calls a tie a -20% loss. To A/B this again, revert this commit rather than adding
+// a macro back: the three sites live in two files and must move together.
+// The #else branches in mul_mm_funcs.glsl are still live - they serve the dense
+// (non-MUL_MAT_ID) variant, which has no tile-row scale cache.
 // 8 sub-block (d, m) pairs per tile row, refilled once per superblock (every
 // 8th BK=32 iteration) so 7 of 8 iterations pay no fill or extra barrier.
 shared vec2 scache_dm[BM * 8];
@@ -310,7 +323,7 @@ void main() {
 #endif
 
     for (uint block = start_k; block < end_k; block += BK) {
-#ifdef MMID_QK_SCACHE
+#if defined(MUL_MAT_ID) && (defined(DATA_A_Q5_K) || defined(DATA_A_Q4_K))
         // refill all 8 sub-block (d, m) pairs per row at each superblock boundary
         if ((block & 255) == 0) {
             for (uint x = gl_LocalInvocationID.x; x < BM * 8; x += gl_WorkGroupSize.x) {
