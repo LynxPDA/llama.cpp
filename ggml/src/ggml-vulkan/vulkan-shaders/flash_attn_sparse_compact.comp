@@ -24,7 +24,7 @@ layout (push_constant) uniform parameter {
 
 shared uint count;
 shared uint chunk_base;
-shared uint sub_tot[8];
+shared uint sub_tot[32]; // one slot per subgroup: 1024 threads / 32 lanes max = 32
 
 // One workgroup per mask row: compact finite-mask KV positions into a per-row index list of
 // length n_kv_max, -1 padded. The list must be in ascending position order (it is the FA's
