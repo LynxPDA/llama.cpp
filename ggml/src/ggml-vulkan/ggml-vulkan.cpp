@@ -12467,11 +12467,13 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     // head; only the gather gains a head dimension. The dequant-on-gather variant stays
     // MLA-only, so a GQA union runs verbatim f16 rows.
     const bool gqa_form = n_head_kv != 1 || separate_v;
-    static const bool union_gqa_env = getenv("GGML_VK_FA_TOPK_UNION_GQA") != nullptr;
-    // The grouped union for a GQA cache stays opt-in: the per-row sparse compaction above
-    // attends each row's own selection (n_kv_max rows) and measured ahead of any shared-set
-    // compaction at depth.
-    if ((union_gqa_env && (!union_env || union_env[0] != '0')) && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
+    // The grouped union for a GQA cache is on by default (GGML_VK_FA_TOPK_UNION_GQA=0 opts
+    // out): the per-row sparse compaction it replaced declined on every prefill batch
+    // (quadratic in batch), so the grouped union is the only sparse prefill a GQA cache
+    // gets, and its gate already declines wherever it would not pay.
+    static const char * union_gqa_env = getenv("GGML_VK_FA_TOPK_UNION_GQA");
+    const bool union_gqa_enabled = !(union_gqa_env && union_gqa_env[0] == '0');
+    if (union_gqa_enabled && (!union_env || union_env[0] != '0') && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
         (!gqa_form || (v_word_addressable && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16)) &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
