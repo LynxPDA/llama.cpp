@@ -10418,10 +10418,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 257,  17, 1, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 512, 512, 1, 1, GGML_TYPE_F16));
 
-    // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). The Vulkan sparse path engages
-    // when kv >= 3*(n_kv_raw + n_top_k) AND nb >= 64 (prefill-only); the nb < 64 cases
-    // and the kv=512 case verify dense-fallback parity with the hint attached, the
-    // nb=64/128 cases exercise the sparse shader itself.
+    // sparse top-k FA: (kv, nb, n_kv_raw, n_top_k, sinks). Whether the hint is honoured
+    // depends on the shape, not on nb: the Vulkan paths gate on gqa_ratio > 1 (one selection
+    // per query, shared by its heads) for per-tile compaction, and on the measured union
+    // being smaller than the dense cache for the grouped union. The nb < 64 cases and the
+    // kv=512 case verify dense-fallback parity with the hint attached; the larger shapes
+    // exercise the sparse shaders themselves.
     test_cases.emplace_back(new test_flash_attn_ext_top_k(4096,  1, 256, 512, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768,  8,  64, 128, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k( 768, 17,  64, 128, false));
@@ -10439,6 +10441,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // sparse path; the nb=1..4 cells above only cover the gather path)
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768,  64, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
     test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, 128, 0, 2051, false, 1, 0, GGML_TYPE_F16, 256, 24, 2, false));
+    // The same shapes with realistic adjacent-token overlap. A QSA selection is whole blocks of
+    // 4 cells, so neighbouring tokens share most of their picks - which is what makes a
+    // deduplicated UNION (one set per group of query rows, instead of one set per row) worth
+    // building for prefill. ov=0 above says nothing about it: with disjoint picks the union is
+    // the whole cache and the gate correctly declines.
+    //
+    // These four cells exist to cover the grouped union's host addressing (the union/gather/FA
+    // dispatch sequence), which dense-fallback cases cannot: a wrong push constant there is
+    // invisible whenever the union is not taken. That gate is a measurement, so run them with
+    // GGML_VK_FA_TOPK_UNION_GQA=1 GGML_VK_FA_UNION_FORCE=1 to have the path taken at all -
+    // without it they cover the fallback, which is still worth asserting but is not this.
+    for (int nb : { 64, 128 }) {
+        for (int ov : { 60, 86 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_top_k(32768, nb, 0, 2051, false, 1, ov, GGML_TYPE_F16, 256, 24, 2, false));
+        }
+    }
     // ns > 1: the split-K partial-output path indexes O and L/M by stream, so these cover
     // the stream stride in both regions (single tile and multi-tile).
     // small-batch decode (speculative drafts): each token gets its own gathered top-k block,

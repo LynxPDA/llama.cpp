@@ -12322,13 +12322,22 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
 
         vk_subbuffer q_buf   = ggml_vk_tensor_subbuffer(ctx, q);
         q_buf.offset   += batch_off * (uint64_t) q->nb[1];
+        // dst is [HSV, n_head_q, n_batch, ns]: one batch row is n_head_q*HSV wide, so the
+        // group's slice starts nb[2] (not nb[1], which is the head stride) into the tensor.
         vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
-        dst_buf.offset += batch_off * (uint64_t) dst->nb[1];
+        dst_buf.offset += batch_off * (uint64_t) dst->nb[2];
         vk_subbuffer sinks_buf = q_buf;
         const vk_subbuffer k_buf = st.kc_buf, v_buf = st.vc_buf, mask_buf = st.mc_buf;
 
+        // ne1/ne2 are the destination's shape, not this group's: ne1 is the head COUNT and sets
+        // the head-to-head stride of the output (o_offset + iq2*HSV + row*ne1*HSV, dst being
+        // [HSV, n_head_q, n_batch, ns]), so it must be q->ne[2]; passing the group's row count
+        // there misplaces every head but the first and only looked right on the nh == nb shapes
+        // the tests happened to use. ne2 is the row count of the split buffer, which holds this
+        // group alone (ne3 == ns), and it must agree with the allocation below and with the
+        // reduce's own ne2. The group's row count is N, used by the tile math and the mask.
         const vk_flash_attn_push_constants pc = { N, st.kv_c,
-                                                  (uint32_t) N, neq2, 1,
+                                                  neq2, rows, 1,
                                                   neq2, 1,
                                                   st.n_head_kv, 1,
                                                   st.n_head_kv, 1,
@@ -12348,9 +12357,13 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
                 {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, q_buf, st.kv_buf},
                 pc, { dispatch_x, workgroups_y, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
-            const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t) N, neq2, neq2, 1, split_k, false };
+            // Same convention as the dense call (see ggml_vk_flash_attn): x enumerates HEADS,
+            // z the split buffer's rows, ne1 is the head stride of both the split buffer and the
+            // destination. The group's split buffer and dst subbuffer both start at this group's
+            // first row, so both row counts are N here.
+            const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, neq2, N, N, 1, split_k, false };
             ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
-                {split_k_buf, sinks_buf, dst_buf}, pc2, { (uint32_t) N, HSV, neq2 });
+                {split_k_buf, sinks_buf, dst_buf}, pc2, { neq2, HSV, N });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                 {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, q_buf, st.kv_buf},
@@ -12478,8 +12491,18 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
         // roughly dense cost for the one step it takes the estimate to catch up.
         // For the union the compact bound is the SOURCE size (one row per distinct cell, so
         // never more than n_kv_raw + R), not the per-token kv_c above.
-        const bool worth_it = kv_c_est != 0 && kv_c_est < kv_c_bound &&
+        bool worth_it = kv_c_est != 0 && kv_c_est < kv_c_bound &&
                               (uint64_t) k->ne[1] >= 2ull * kv_c_est;
+        // GGML_VK_FA_UNION_FORCE=1 admits the union without the estimate. The gate above is a
+        // measurement, so the call that produces it is also the call that must decline on it -
+        // which leaves the path with no deterministic coverage and no A/B arm, since
+        // test-backend-ops computes a case once and a timing comparison has to have the path
+        // taken. These are the two things this switch exists for; it costs only a slow step.
+        static const char * force_env = getenv("GGML_VK_FA_UNION_FORCE");
+        static const bool   union_force = force_env && force_env[0] != '\0' && force_env[0] != '0';
+        if (union_force) {
+            worth_it = true;
+        }
 
         // GGML_VK_FA_UNION_STATS=N: report every Nth call (N=1 means every call) what the gate
         // decided and on what measurement. The alternative is inferring engagement from a
@@ -12623,7 +12646,8 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             dq ? (uint32_t) (k->nb[1] / ggml_type_size(k->type)) : (uint32_t) (k->nb[1] / 4),
             (uint32_t) (mask->nb[1] / sizeof(ggml_fp16_t)),
             n_batch, dq ? (uint32_t) k->ne[0] : k_row_words,
-            0u,
+            0u,   // src_head_stride: the MLA row has one head
+            0u,   // batch_off: the whole batch is one group here
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, gather_pipe,
             { ggml_vk_tensor_subbuffer(ctx, k), ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
