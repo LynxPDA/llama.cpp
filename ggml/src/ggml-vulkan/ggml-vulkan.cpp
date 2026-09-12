@@ -12220,17 +12220,47 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
     const uint32_t k_row_words = st.row_bytes / 4;
     const uint32_t v_row_words = st.v_row_bytes / 4;
 
+    // Per-group scratch slots. Every group gets its own union-list region and its own
+    // kv-count slot, so a group's scan has no data dependency on any other group's work:
+    // scan(g+1) is issued right after FA(g) with NO barrier between them, so it overlaps
+    // the FA on the GPU instead of paying a serialized 4 ms after it. The gathers still
+    // reuse the single compact K/V/mask region, so a barrier separates FA(g) from
+    // gather(g+1) (and scan(g+1) from gather(g+1), the sync below).
+    // NOTE: the kv-count slot MUST be 4 uints apart because the scan writes 4 words and the
+    // estimator reads slot 0 (group 0) as the latest measurement.
+    const size_t ul_slot_sz = (size_t) st.ul_words * sizeof(uint32_t);
+    const size_t kv_slot_sz = 16;
+    const size_t ul_base = st.ul_buf.offset;
+
+    // Group 0's scan first: the first gather needs its list and count.
+    {
+        const uint32_t rows = std::min(st.group_rows, n_batch_total);
+        const vk_op_flash_attn_union_push_constants upc0 = {
+            (uint32_t) k->ne[1], (uint32_t) n_kv_raw, rows, (uint32_t) top_k->ne[0], st.ul_words,
+            (uint32_t) (top_k->nb[1] / sizeof(int32_t)), VK_FA_UNION_MAX_WORDS, 256u, 0u, 0u,
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
+            { ggml_vk_tensor_subbuffer(ctx, top_k),
+              ggml_vk_subbuffer(ctx, st.ul_buf.buffer, ul_base),
+              ggml_vk_subbuffer(ctx, st.kv_buf.buffer, 0) }, upc0, { 1, 1, 1 });
+    }
+
     for (uint32_t g = 0; g < st.n_groups; ++g) {
         const uint32_t rows = std::min(st.group_rows, n_batch_total - g * st.group_rows);
         const uint32_t batch_off = g * st.group_rows;
+        const vk_subbuffer ul_g = ggml_vk_subbuffer(ctx, st.ul_buf.buffer, ul_base + g * ul_slot_sz);
+        const vk_subbuffer kv_g = ggml_vk_subbuffer(ctx, st.kv_buf.buffer, g * kv_slot_sz);
 
-        ggml_vk_sync_buffers(ctx, subctx);
-        const vk_op_flash_attn_union_push_constants upc = {
-            (uint32_t) k->ne[1], (uint32_t) n_kv_raw, rows, (uint32_t) top_k->ne[0], st.ul_words,
-            (uint32_t) (top_k->nb[1] / sizeof(int32_t)), VK_FA_UNION_MAX_WORDS, 256u, 0u, batch_off,
-        };
-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
-            { ggml_vk_tensor_subbuffer(ctx, top_k), st.ul_buf, st.kv_buf }, upc, { 1, 1, 1 });
+        if (g > 0) {
+            // Independent of everything issued so far: own ul slot, own count slot,
+            // reads only the top-k tensor. No barrier: may overlap the previous FA.
+            const vk_op_flash_attn_union_push_constants upc = {
+                (uint32_t) k->ne[1], (uint32_t) n_kv_raw, rows, (uint32_t) top_k->ne[0], st.ul_words,
+                (uint32_t) (top_k->nb[1] / sizeof(int32_t)), VK_FA_UNION_MAX_WORDS, 256u, 0u, batch_off,
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_union_f16,
+                { ggml_vk_tensor_subbuffer(ctx, top_k), ul_g, kv_g }, upc, { 1, 1, 1 });
+        }
         ggml_vk_sync_buffers(ctx, subctx);
 
         const vk_op_flash_attn_gather_union_push_constants gkpc = {
@@ -12242,8 +12272,8 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
             batch_off,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
-            { ggml_vk_tensor_subbuffer(ctx, k), st.ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
-              st.kc_buf, st.mc_buf, st.kv_buf }, gkpc, { st.kv_c, st.n_head_kv, 1 });
+            { ggml_vk_tensor_subbuffer(ctx, k), ul_g, ggml_vk_tensor_subbuffer(ctx, mask),
+              st.kc_buf, st.mc_buf, kv_g }, gkpc, { st.kv_c, st.n_head_kv, 1 });
         const vk_op_flash_attn_gather_union_push_constants gvpc = {
             (uint32_t) k->ne[1], (uint32_t) n_kv_raw, st.kv_c,
             (uint32_t) (v->nb[1] / 4),
@@ -12253,8 +12283,8 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
             batch_off,
         };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_gather_union_f16,
-            { ggml_vk_tensor_subbuffer(ctx, v), st.ul_buf, ggml_vk_tensor_subbuffer(ctx, mask),
-              st.vc_buf, st.mc_buf, st.kv_buf }, gvpc, { st.kv_c, st.n_head_kv, 1 });
+            { ggml_vk_tensor_subbuffer(ctx, v), ul_g, ggml_vk_tensor_subbuffer(ctx, mask),
+              st.vc_buf, st.mc_buf, kv_g }, gvpc, { st.kv_c, st.n_head_kv, 1 });
         ggml_vk_sync_buffers(ctx, subctx);
 
         // flash attention against the group's compact set
@@ -12354,7 +12384,7 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
             const uint32_t dispatch_x = Tr * split_k * pipeline->wg_denoms[0];
             vk_subbuffer split_k_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, q_buf, st.kv_buf},
+                {q_buf, k_buf, v_buf, mask_buf, sinks_buf, split_k_buf, q_buf, kv_g},
                 pc, { dispatch_x, workgroups_y, 1 });
             ggml_vk_sync_buffers(ctx, subctx);
             // Same convention as the dense call (see ggml_vk_flash_attn): x enumerates HEADS,
@@ -12366,7 +12396,7 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
                 {split_k_buf, sinks_buf, dst_buf}, pc2, { neq2, HSV, N });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-                {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, q_buf, st.kv_buf},
+                {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, q_buf, kv_g},
                 pc, { workgroups_x, workgroups_y, 1 });
         }
     }
@@ -12575,7 +12605,11 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             const size_t gvc_sz = (size_t) n_head_kv * g_kv_c * v_row_by;
             const size_t gmc_sz = (size_t) group_rows * g_kv_c * sizeof(ggml_fp16_t);
             const size_t gul_sz = (size_t) g_max_union * sizeof(uint32_t);
-            const size_t gneed  = gkc_sz + gvc_sz + gmc_sz + gul_sz;
+            // One union-list slot per group: the groups' scans are independent and run
+            // concurrently (see ggml_vk_flash_attn_union_groups), so they cannot share a
+            // region. The compact K/V/mask region stays single-slot (serialized gathers).
+            const size_t gul_all = gul_sz * CEIL_DIV(n_batch, group_rows);
+            const size_t gneed  = gkc_sz + gvc_sz + gmc_sz + gul_all;
             if (ctx->prealloc_size_y < gneed) {
                 ctx->prealloc_size_y = gneed;
                 ggml_vk_preallocate_buffers(ctx, subctx);
