@@ -2326,10 +2326,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     void prefetch_batch_rows(const llama_token * tokens, uint32_t n_tokens) const override;
 
     std::vector<const struct ggml_tensor *> gather_tables() const override {
-        if (per_layer_tok_embd == nullptr) {
-            return {};
+        if (per_layer_tok_embd != nullptr) {
+            return { per_layer_tok_embd };
         }
-        return { per_layer_tok_embd };
+        return std::vector<const struct ggml_tensor *>(per_layer_tok_embd_h.begin(), per_layer_tok_embd_h.end());
     }
 
     struct graph : public llm_build_delta_net_base {

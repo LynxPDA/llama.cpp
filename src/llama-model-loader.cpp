@@ -666,7 +666,10 @@ llama_model_loader::llama_model_loader(
             {
                 const int n_tensors_loaded = (int) weights_map.size();
                 if (n_tensors != n_tensors_loaded) {
-                    throw std::runtime_error(format("corrupted model: %d tensors expected but %d found", n_tensors, n_tensors_loaded));
+                    // a shard rewritten with a tensor split into parts (qwen4exp per-head PLE tables)
+                    // keeps the main file's count; trust what was actually read
+                    LLAMA_LOG_WARN("%s: split.tensors.count says %d tensors, %d found; using %d\n", __func__, n_tensors, n_tensors_loaded, n_tensors_loaded);
+                    n_tensors = n_tensors_loaded;
                 }
             }
 
@@ -1291,7 +1294,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     if ((flags & TENSOR_READ_LAZY) && use_mmap && tensor_read_lazy != LLAMA_TENSOR_READ_LAZY_OFF) {
         // in auto mode, small tensors are cheap enough to keep resident
         constexpr size_t auto_lazy_min_size = 4ull * 1024 * 1024 * 1024;
-        if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || ggml_nbytes(cur) > auto_lazy_min_size) {
+        if (tensor_read_lazy == LLAMA_TENSOR_READ_LAZY_ON || (flags & TENSOR_READ_LAZY_SMALL) || ggml_nbytes(cur) > auto_lazy_min_size) {
             const auto & w = require_weight(tn.str().c_str());
             lazy_tensor_ranges[w.idx].emplace_back(w.offs, w.offs + ggml_nbytes(cur));
 

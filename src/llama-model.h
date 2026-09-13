@@ -688,6 +688,10 @@ struct llama_model {
     struct ggml_tensor * altup_proj           = nullptr;
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
+    // qwen4exp: the same table split per indexer head (per_layer_token_embd.h{h}.weight), one
+    // tensor per hash range, so no single buffer exceeds a backend's allocation cap and the
+    // table can be device-resident. Empty when the file carries the single tensor.
+    std::vector<struct ggml_tensor *> per_layer_tok_embd_h;
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;
@@ -842,6 +846,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_READ_LAZY_SMALL;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

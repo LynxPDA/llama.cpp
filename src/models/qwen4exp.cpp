@@ -193,12 +193,22 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     if (hparams.ple_n_heads > 0) {
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
         const auto * ple_w = ml.get_weight(ple_name.c_str());
-        GGML_ASSERT(ple_w != nullptr && "qwen4exp is missing the PLE n-gram table");
-        const int64_t ple_rows = ple_w->tensor->ne[1];
-        // the PLE/engram table is gathered 16 random rows per token and never read densely, so
-        // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        if (ple_w != nullptr) {
+            const int64_t ple_rows = ple_w->tensor->ne[1];
+            // the PLE/engram table is gathered 16 random rows per token and never read densely, so
+            // it wants MADV_RANDOM and no eager pull-in. See --tensor-read-lazy.
+            per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                                               { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        } else {
+            // per-head split of the same table (see llama_model::per_layer_tok_embd_h): head h holds
+            // rows [ple_head_offsets[h], + ple_head_vocab_sizes[h]) of the single tensor
+            for (uint32_t h = 0; h < hparams.ple_n_heads; ++h) {
+                const std::string suffix = "h" + std::to_string(h) + ".weight";
+                per_layer_tok_embd_h.push_back(create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, suffix.c_str()),
+                        { hparams.ple_head_dim, (int64_t) hparams.ple_head_vocab_sizes[h] }, TENSOR_READ_LAZY | TENSOR_READ_LAZY_SMALL));
+            }
+            GGML_ASSERT(!per_layer_tok_embd_h.empty() && "qwen4exp is missing the PLE n-gram table");
+        }
     }
 
     for (int il = 0; il < (int) hparams.n_layer_all; ++il) {
@@ -1389,7 +1399,7 @@ void llama_model_qwen4exp::prefetch_batch_rows(const llama_token * tokens, uint3
     // (pwilkin's on-direct reader), not page-fault advice. Kept for that comparison.
     static const bool off = !(getenv("LLAMA_PLE_PREFETCH_BATCH") && atoi(getenv("LLAMA_PLE_PREFETCH_BATCH")) != 0);
     const auto & hp = hparams;
-    if (off || !tokens || per_layer_tok_embd == nullptr || hp.ple_n_heads == 0 || hp.ple_ngram_size == 0 || n_tokens < 2) {
+    if (off || !tokens || (per_layer_tok_embd == nullptr && per_layer_tok_embd_h.empty()) || hp.ple_n_heads == 0 || hp.ple_ngram_size == 0 || n_tokens < 2) {
         return;
     }
     const int64_t n_heads = hp.ple_n_heads;
@@ -1402,7 +1412,17 @@ void llama_model_qwen4exp::prefetch_batch_rows(const llama_token * tokens, uint3
         }
         qwen4exp_ple_rows(hp, tokens[i], window, idx.data() + (size_t) i * n_heads);
     }
-    prefetch_rows(per_layer_tok_embd, idx.data(), idx.size());
+    if (per_layer_tok_embd != nullptr) {
+        prefetch_rows(per_layer_tok_embd, idx.data(), idx.size());
+        return;
+    }
+    std::vector<int32_t> loc(n_tokens);
+    for (int64_t h = 0; h < n_heads; ++h) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            loc[i] = idx[(size_t) i*n_heads + h] - (int32_t) hp.ple_head_offsets[h];
+        }
+        prefetch_rows(per_layer_tok_embd_h[h], loc.data(), n_tokens);
+    }
 }
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1452,31 +1472,48 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // the table is far too big to offload, so it is gathered straight out of the mapping: one
     // fault per row, 16 per token, no two of them on the same page. left to the get_rows those
     // faults happen one at a time; queued here they are in flight before the graph even runs.
-    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    const bool split = pmodel.per_layer_tok_embd == nullptr;
+
+    // per-head tables take head-local ids in head-major order
+    std::vector<int32_t> idx_h;
+    if (split) {
+        idx_h.resize(idx.size());
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            for (int64_t h = 0; h < n_heads; ++h) {
+                idx_h[h*n_tokens + i] = idx[i*n_heads + h] - (int32_t) hp.ple_head_offsets[h];
+            }
+        }
+        for (int64_t h = 0; h < n_heads; ++h) {
+            pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
+        }
+    } else {
+        pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+    }
 
     if (rows) {
-        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        const std::vector<int32_t> & src = split ? idx_h : idx;
+        ggml_backend_tensor_set(rows, src.data(), 0, src.size()*ggml_element_size(rows));
         return;
     }
 
     // Gather host-side. Head varies fastest within a token, the layout ggml_get_rows produced for
     // the same index vector, so the flattened [head_dim * n_heads] row per token is unchanged.
-    const ggml_tensor * tbl      = pmodel.per_layer_tok_embd;
-    const int64_t       head_dim = tbl->ne[0];
-    const size_t        row_sz   = ggml_row_size(tbl->type, head_dim);
-    const char *        base     = (const char *) tbl->data;
+    const ggml_tensor * tbl0     = split ? pmodel.per_layer_tok_embd_h[0] : pmodel.per_layer_tok_embd;
+    const int64_t       head_dim = tbl0->ne[0];
+    const size_t        row_sz   = ggml_row_size(tbl0->type, head_dim);
+    const ggml_type_traits * traits = tbl0->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(tbl0->type);
+    GGML_ASSERT(tbl0->type == GGML_TYPE_F32 || (traits->to_float && "PLE table type has no to_float"));
 
     // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical
     std::vector<float> vals((size_t) head_dim * idx.size());
-    if (tbl->type == GGML_TYPE_F32) {
-        for (size_t k = 0; k < idx.size(); ++k) {
-            memcpy(vals.data() + k*head_dim, base + (size_t) idx[k]*row_sz, head_dim*sizeof(float));
-        }
-    } else {
-        const ggml_type_traits * traits = ggml_get_type_traits(tbl->type);
-        GGML_ASSERT(traits->to_float && "PLE table type has no to_float");
-        for (size_t k = 0; k < idx.size(); ++k) {
-            traits->to_float(base + (size_t) idx[k]*row_sz, vals.data() + k*head_dim, head_dim);
+    for (size_t k = 0; k < idx.size(); ++k) {
+        const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+        const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
+        const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+        if (traits == nullptr) {
+            memcpy(vals.data() + k*head_dim, base + (size_t) row*row_sz, head_dim*sizeof(float));
+        } else {
+            traits->to_float(base + (size_t) row*row_sz, vals.data() + k*head_dim, head_dim);
         }
     }
 
@@ -1560,8 +1597,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
         ggml_tensor * rows = ple_inp->rows;
         res->add_input(std::move(ple_inp));
 
-        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        if (model.per_layer_tok_embd != nullptr) {
+            emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+            emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+        } else {
+            // per-head tables: rows is head-major [n_tokens per head] with head-local ids; gather each
+            // head and lay the heads out slowest within a token, as the single get_rows did
+            ggml_tensor * stack = nullptr;
+            for (int64_t h = 0; h < n_heads; ++h) {
+                ggml_tensor * rows_h = ggml_view_1d(ctx0, rows, n_tokens, h * n_tokens * ggml_element_size(rows));
+                ggml_tensor * e_h    = ggml_get_rows(ctx0, model.per_layer_tok_embd_h[h], rows_h);   // [head_dim, n_tokens]
+                e_h = ggml_reshape_3d(ctx0, e_h, hparams.ple_head_dim, 1, n_tokens);
+                stack = stack ? ggml_concat(ctx0, stack, e_h, 1) : e_h;
+            }
+            emb = ggml_reshape_2d(ctx0, ggml_cont(ctx0, stack), hparams.ple_head_dim * n_heads, n_tokens);
+        }
     }
     cb(emb, "ple_embd", il);
 
