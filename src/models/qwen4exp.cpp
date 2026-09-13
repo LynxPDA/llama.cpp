@@ -1342,6 +1342,69 @@ bool llm_graph_input_ple::can_reuse(const llm_graph_params & params) {
     return false;
 }
 
+// PLE row ids for one token: n-gram hashes of the token with its predecessors. window[s] is the
+// predecessor s positions back (index 0 unused); an EOS in the window resets everything at or
+// before it, and a missing predecessor (LLAMA_TOKEN_NULL: before the sequence start, or no cached
+// cell) reads as EOS. The EOS of the token itself does not cut its own context, as in the reference.
+// Shared by the per-ubatch input (exact, predecessors from the KV cells) and the batch-level
+// readahead (predecessors taken from the batch order).
+static void qwen4exp_ple_rows(const llama_hparams & hp, llama_token tok, const llama_token * window, int32_t * out) {
+    const int64_t n_gram   = hp.ple_ngram_size;
+    const int64_t per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos      = hp.ple_eos_token_id;
+
+    int64_t ctx[LLAMA_MAX_PLE_NGRAM];
+    ctx[0] = tok;
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; ++s) {
+        const llama_token t = cut ? LLAMA_TOKEN_NULL : window[s];
+        cut = cut || t < 0 || t == eos;
+        ctx[s] = cut ? eos : t;
+    }
+
+    for (int64_t n = 2; n <= n_gram; ++n) {
+        uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+        for (int64_t j = 1; j < n; ++j) {
+            mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+        }
+        const int64_t base = (n - 2) * per_gram;
+        for (int64_t g = 0; g < per_gram; ++g) {
+            const int64_t h_i = base + g;
+            out[h_i] = (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
+        }
+    }
+}
+
+// Batch-level readahead (LLAMA_PLE_PREFETCH_BATCH=0 disables). Measured 2026-09-13 on the pruned
+// 320-expert model at 32k context: set_inputs was 640-690 ms of a 4.6 s ubatch, nearly all of it
+// the PLE gather paging its rows from NVMe, because the 96 GB f16 table cannot be page-cached next
+// to the GPU-resident weights on a 64 GB box. The batch's tokens are known before its first ubatch
+// runs, so the rows of every later ubatch can be in flight while the first one computes.
+void llama_model_qwen4exp::prefetch_batch_rows(const llama_token * tokens, uint32_t n_tokens) const {
+    // OPT-IN (LLAMA_PLE_PREFETCH_BATCH=1). Measured 2026-09-13, pruned model, -b 8192 -ub 2048: the
+    // 131k advice calls cost 2.2-3.4 s synchronously before the first ubatch and the in-flight reads
+    // slowed compute ~0.5 s per ubatch; set_inputs fell 650 -> 100 ms but the call was 14% slower at
+    // d0 (555 vs 645 pp8192) and only won at 32k because the plain arm hit multi-second disk stalls.
+    // The paging itself (~23% of the decode wall on this 64 GB box) wants a direct-read thread pool
+    // (pwilkin's on-direct reader), not page-fault advice. Kept for that comparison.
+    static const bool off = !(getenv("LLAMA_PLE_PREFETCH_BATCH") && atoi(getenv("LLAMA_PLE_PREFETCH_BATCH")) != 0);
+    const auto & hp = hparams;
+    if (off || !tokens || per_layer_tok_embd == nullptr || hp.ple_n_heads == 0 || hp.ple_ngram_size == 0 || n_tokens < 2) {
+        return;
+    }
+    const int64_t n_heads = hp.ple_n_heads;
+    const int64_t n_gram  = hp.ple_ngram_size;
+    std::vector<int32_t> idx((size_t) n_heads * n_tokens);
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        llama_token window[LLAMA_MAX_PLE_NGRAM];
+        for (int64_t s = 1; s < n_gram; ++s) {
+            window[s] = (int64_t) i - s >= 0 ? tokens[i - s] : LLAMA_TOKEN_NULL;
+        }
+        qwen4exp_ple_rows(hp, tokens[i], window, idx.data() + (size_t) i * n_heads);
+    }
+    prefetch_rows(per_layer_tok_embd, idx.data(), idx.size());
+}
+
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
@@ -1378,31 +1441,12 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
     for (int64_t i = 0; i < n_tokens; ++i) {
-        // an EOS in the window resets everything at or before it, and a missing predecessor
-        // (before the sequence start, or no cached cell) reads as EOS
-        // the EOS of the token itself does not cut its own context, as in the reference
-        std::vector<int64_t> ctx(n_gram);
-        ctx[0] = tok_of(i);
-        bool cut = false;
+        // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
+        llama_token window[LLAMA_MAX_PLE_NGRAM];
         for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = cut ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            cut = cut || t < 0 || t == eos;
-            ctx[s] = cut ? eos : t;
+            window[s] = prev[i*n_prev + (n_prev - s)];
         }
-
-        for (int64_t n = 2; n <= n_gram; ++n) {
-            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
-            for (int64_t j = 1; j < n; ++j) {
-                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
-            }
-            const int64_t base = (n - 2) * per_gram;
-            for (int64_t g = 0; g < per_gram; ++g) {
-                const int64_t h_i = base + g;
-                idx[i * n_heads + h_i] =
-                    (int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]);
-            }
-        }
+        qwen4exp_ple_rows(hp, tok_of(i), window, idx.data() + i * n_heads);
     }
 
     // the table is far too big to offload, so it is gathered straight out of the mapping: one

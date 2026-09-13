@@ -1717,6 +1717,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
+
+    // readahead for the gather tables over the whole batch (a hint; see llama_model::prefetch_batch_rows)
+    if (n_tokens_all > cparams.n_ubatch) {
+        model.prefetch_batch_rows(balloc->get_batch().token, n_tokens_all);
+    }
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
     if (output_all) {

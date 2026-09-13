@@ -790,6 +790,14 @@ struct llama_model {
     // such as token_embd on a CPU-only run, wants the readahead this takes away.
     virtual std::vector<const struct ggml_tensor *> gather_tables() const { return {}; }
 
+    // Queue readahead for every gather-table row a whole batch will touch, before its first ubatch
+    // runs. A hint only: the per-ubatch set_input still resolves and prefetches its exact rows, so a
+    // wrong guess here (multi-sequence batches, predecessors outside the batch) costs a wasted
+    // readahead, never a wrong row. Default: nothing.
+    virtual void prefetch_batch_rows(const llama_token * tokens, uint32_t n_tokens) const {
+        GGML_UNUSED(tokens); GGML_UNUSED(n_tokens);
+    }
+
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 

@@ -2323,6 +2323,8 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     // the PLE n-gram table is far too big to offload and is read by 16 tiny gathers per token
+    void prefetch_batch_rows(const llama_token * tokens, uint32_t n_tokens) const override;
+
     std::vector<const struct ggml_tensor *> gather_tables() const override {
         if (per_layer_tok_embd == nullptr) {
             return {};
