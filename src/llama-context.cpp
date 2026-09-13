@@ -1324,6 +1324,9 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    static const bool input_timing_b = getenv("LLAMA_INPUT_TIMING") && atoi(getenv("LLAMA_INPUT_TIMING")) != 0;
+    const int64_t t_build0_us = input_timing_b ? ggml_time_us() : 0;
+    bool graph_reused = false;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1338,6 +1341,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     if (!graph_reuse_disable && res->can_reuse(gparams)) {
+        graph_reused = true;
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1373,17 +1377,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // LLAMA_INPUT_TIMING=1: per-ubatch host/compute split. At 32k context on Qwen3.8-Flash-Next the
+    // wall was 45% above the GPU op sum (2026-09-13 perflog); this says where.
+    static const bool input_timing = getenv("LLAMA_INPUT_TIMING") && atoi(getenv("LLAMA_INPUT_TIMING")) != 0;
+    const int64_t t_inputs_us = input_timing ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    const int64_t t_compute_us = input_timing ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (input_timing) {
+        const int64_t t_end = ggml_time_us();
+        extern int64_t llama_kq_mask_time_us;
+        LLAMA_LOG_INFO("[input-timing] n_tokens=%u build+alloc %.1f ms (%s) set_inputs %.1f ms (kq_mask %.1f ms) compute %.1f ms\n",
+                ubatch.n_tokens, (t_inputs_us - t_build0_us)/1000.0, graph_reused ? "reused" : "built",
+                (t_compute_us - t_inputs_us)/1000.0, llama_kq_mask_time_us/1000.0, (t_end - t_compute_us)/1000.0);
+        llama_kq_mask_time_us = 0;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1634,6 +1648,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    static const bool decode_timing = getenv("LLAMA_INPUT_TIMING") && atoi(getenv("LLAMA_INPUT_TIMING")) != 0;
+    const int64_t t_dec0_us = decode_timing ? ggml_time_us() : 0;
+    int64_t t_dec_init_us = 0, t_dec_ub_us = 0, t_dec_loop_us = 0;
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1786,6 +1803,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
+    if (decode_timing) { t_dec_init_us = ggml_time_us(); }
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -1816,7 +1834,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        const int64_t t_ub0_us = decode_timing ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (decode_timing) { t_dec_ub_us += ggml_time_us() - t_ub0_us; }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1971,6 +1991,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+    if (decode_timing) { t_dec_loop_us = ggml_time_us(); }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2024,6 +2045,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (decode_timing) {
+        const int64_t t_end = ggml_time_us();
+        LLAMA_LOG_INFO("[decode-timing] n_tokens=%u total %.1f ms: init+slots %.1f, process_ubatch %.1f, loop other %.1f, tail %.1f\n",
+                n_tokens_all, (t_end - t_dec0_us)/1000.0, (t_dec_init_us - t_dec0_us)/1000.0, t_dec_ub_us/1000.0,
+                (t_dec_loop_us - t_dec_init_us - t_dec_ub_us)/1000.0, (t_end - t_dec_loop_us)/1000.0);
+    }
 
     return 0;
 }
