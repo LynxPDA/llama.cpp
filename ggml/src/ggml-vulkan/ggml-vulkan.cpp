@@ -1976,6 +1976,17 @@ static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 // Shared bitmap capacity in flash_attn_union.comp: 12288 words = 393216 compressed rows.
 static constexpr uint32_t VK_FA_UNION_MAX_WORDS = 12288;
 
+// Query rows per union group. A GQA batch is priced per group, so this is also the batch the
+// estimator is keyed by (see the gate in ggml_vk_flash_attn_gather_compact).
+static constexpr uint32_t VK_FA_UNION_GROUP_ROWS = 64;
+// Per-group slot in the union stat buffer: the scan writes four uints per group (padded compact
+// rows, raw union size, candidate count, batch). One slot per group of the largest batch, because
+// a prefill dispatches every group's scan and each writes its own slot - the slot is what makes
+// scan(g+1) data-independent of FA(g). A buffer sized for one slot leaves all but the first group
+// writing past its end.
+static constexpr uint32_t VK_FA_UNION_STAT_SLOT   = 16;
+static constexpr uint32_t VK_FA_UNION_STAT_GROUPS = 256;   // covers ub 16384
+
 struct vk_op_flash_attn_union_push_constants {
     uint32_t n_kv, n_kv_raw, n_batch, n_top_k, max_union, nbt1, max_words, pad_to, count_only;
     uint32_t batch_off; // first top-k row of this group (grouped prefill); 0 otherwise
@@ -2551,6 +2562,8 @@ struct ggml_backend_vk_context {
     // 0.24 at 8) and because a speculative decode varies the batch with the accept count, so a
     // single slot would be invalidated on nearly every step. This path caps the batch at 64.
     vk_buffer fa_union_stat;
+    // Indexed by batch size, so a ub larger than this array would read past its end: the read
+    // site clamps, and 1024 covers the largest ub the server can be started with.
     float     fa_union_est_ratio[1024]; // union / candidates, decaying peak; 0 = unseeded
     uint64_t  fa_union_declines;
     vk::Fence fence, almost_ready_fence;
@@ -12124,7 +12137,7 @@ static bool ggml_vk_fa_union_stat_init(ggml_backend_vk_context * ctx) {
         return ctx->fa_union_stat->ptr != nullptr;
     }
     try {
-        ctx->fa_union_stat = ggml_vk_create_buffer(ctx->device, 64,
+        ctx->fa_union_stat = ggml_vk_create_buffer(ctx->device, VK_FA_UNION_STAT_SLOT * VK_FA_UNION_STAT_GROUPS,
             {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
              vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
     } catch (const vk::SystemError &) {
@@ -12133,7 +12146,7 @@ static bool ggml_vk_fa_union_stat_init(ggml_backend_vk_context * ctx) {
     if (ctx->fa_union_stat->ptr == nullptr) {
         return false;
     }
-    memset(ctx->fa_union_stat->ptr, 0, 64);
+    memset(ctx->fa_union_stat->ptr, 0, VK_FA_UNION_STAT_SLOT * VK_FA_UNION_STAT_GROUPS);
     return true;
 }
 
@@ -12181,7 +12194,10 @@ static uint32_t ggml_vk_fa_union_estimate(ggml_backend_vk_context * ctx, uint32_
         e = e > 0.0f ? 0.5f * r + 0.5f * e : r;
     }
 
-    const float ratio = ctx->fa_union_est_ratio[n_batch];
+    // The read index is clamped: the array is indexed by batch size and a ub can reach its
+    // length, which would read the word after it.
+    const uint32_t nb = std::min<uint32_t>(n_batch, (uint32_t) (sizeof(ctx->fa_union_est_ratio) / sizeof(ctx->fa_union_est_ratio[0])) - 1u);
+    const float ratio = ctx->fa_union_est_ratio[nb];
     if (ratio <= 0.0f) {
         return 0;
     }
@@ -12229,7 +12245,7 @@ static void ggml_vk_flash_attn_union_groups(ggml_backend_vk_context * ctx, vk_co
     // NOTE: the kv-count slot MUST be 4 uints apart because the scan writes 4 words and the
     // estimator reads slot 0 (group 0) as the latest measurement.
     const size_t ul_slot_sz = (size_t) st.ul_words * sizeof(uint32_t);
-    const size_t kv_slot_sz = 16;
+    const size_t kv_slot_sz = VK_FA_UNION_STAT_SLOT;
     const size_t ul_base = st.ul_buf.offset;
 
     // Group 0's scan first: the first gather needs its list and count.
@@ -12505,13 +12521,24 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
     const bool union_gqa_enabled = !(union_gqa_env && union_gqa_env[0] == '0');
     if (union_gqa_enabled && (!union_env || union_env[0] != '0') && q->ne[3] == 1 && n_batch > 1 && bitmap_fits &&
         (!gqa_form || (v_word_addressable && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16)) &&
+        (uint32_t) CEIL_DIV(n_batch, VK_FA_UNION_GROUP_ROWS) <= VK_FA_UNION_STAT_GROUPS &&
         ctx->device->pipeline_flash_attn_union_f16 && ctx->device->pipeline_flash_attn_gather_union_f16 &&
         ggml_vk_fa_union_stat_init(ctx)) {
         const uint32_t R = (uint32_t) (k->ne[1] - n_kv_raw);
         // The economics are per group for a GQA cache: the batch is processed in groups of 64
         // query rows, each against the union of its own selections (see the branch below), so
         // the estimate and the probe run with the group's shape.
-        const uint32_t union_batch = gqa_form ? 64u : n_batch;
+        //
+        // The group is min(64, n_batch), NOT 64. A speculative decode batch is 2-4 rows, so
+        // pricing it as a 64-row group reads past the end of the top-k tensor - the shader
+        // indexes rows [0, 64) of a tensor that has n_batch of them - and files the resulting
+        // garbage under the same estimate slot a prefill group reads. A poisoned slot drives
+        // the estimate up to the source size, the prefill gate then fails its k->ne[1] >=
+        // 2*kv_c_est test at every depth and prefill runs dense: the whole union path silently
+        // disappears for as long as decoding continues, which is a server with speculative
+        // decoding but not a benchmark. Keying by the real group size also keeps the two
+        // shapes' measurements in separate slots instead of overwriting each other.
+        const uint32_t union_batch = gqa_form ? std::min(VK_FA_UNION_GROUP_ROWS, n_batch) : n_batch;
         const uint32_t union_cand  = union_batch * (uint32_t) top_k->ne[0];
         const uint32_t max_union = std::min(union_cand, R);
         const uint32_t kv_c_bound = (uint32_t) GGML_PAD(n_kv_raw + max_union, 256u);
@@ -12597,7 +12624,7 @@ static bool ggml_vk_flash_attn_gather_compact(ggml_backend_vk_context * ctx, vk_
             // reused per group (dispatches are ordered), so the allocation is one group's
             // worst case, not the batch's. ggml_vk_flash_attn_union_groups runs the
             // per-group union/gather/FA sequence; this branch only sizes and files the state.
-            const uint32_t group_rows = 64;
+            const uint32_t group_rows = VK_FA_UNION_GROUP_ROWS;
             const uint32_t g_max_union = max_union;
             const uint32_t g_kv_c = kv_c_bound;
             const uint32_t v_row_by = (uint32_t) ggml_row_size(v->type, v->ne[0]);
