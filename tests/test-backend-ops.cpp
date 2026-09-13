@@ -10682,6 +10682,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
     }
+    // Qwen3.8-Flash-Next prefill shapes at ub2048 (2026-09-13 perflog on the pruned 128/320-expert files)
+    for (int64_t n : {512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 12288, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  2560, n, 6144, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, n, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q5_0, GGML_TYPE_F32, 10240, n,  320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,   320, n, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 128, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q3_K, GGML_TYPE_F32, 320, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 128, 10, false, 2560, n,  640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 10, false, 2560, n,  640));
+    }
     // quant-KV probes at the two model geometries. The quant path takes the dequant-once
     // scratch and stages V through shared memory, so it is not represented by the f16 probes.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, 10240, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
