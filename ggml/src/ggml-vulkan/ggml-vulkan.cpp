@@ -20212,6 +20212,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                // the nodes run one by one now, so the perf logger must not report them under the
+                // fused name: a declined fusion used to look like a fused one that got slow
+                fusion_string = nullptr;
             }
         }
 
