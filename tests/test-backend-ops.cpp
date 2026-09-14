@@ -6277,7 +6277,8 @@ struct test_topk_qsa : public test_case {
 
     // distinct mask ramp + small scores keep every cell value unique, so no top-k ties.
     // The degenerate variant instead floods every row with ties and masked cells: the
-    // threshold then has to be filled from equal values.
+    // threshold then has to be filled from equal values, and the -inf shortcut in the
+    // fused gather has to agree with the reference while the block index is ignored.
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE) {

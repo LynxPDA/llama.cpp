@@ -658,19 +658,25 @@ static constexpr std::initializer_list<ggml_op> snake_pattern              { GGM
                                                                              GGML_OP_SQR,      GGML_OP_MUL,
                                                                              GGML_OP_ADD };
 
-// qwen4 QSA indexer: gather per-block scores to cells + add f16 mask (cast+reshape) + top-k,
-// fused into one radix-select. The cast/reshape are elided; the raw f16 mask is read in-shader.
-static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_GET_ROWS, GGML_OP_PERMUTE,
-                                                                   GGML_OP_CONT,     GGML_OP_CPY,
-                                                                   GGML_OP_RESHAPE,  GGML_OP_ADD,
-                                                                   GGML_OP_TOP_K };
+// qwen4 QSA indexer: transpose the block score into cell rows, gather the cells, add the f16
+// mask (cast+reshape) and radix-select, all fused into one kernel.
+// The pattern starts at the transpose in front of the gather: the kernel wants the values, not
+// the reordered copy, so the copy is folded in and the score is read in its native block-major
+// layout, where a row of consecutive blocks is contiguous. The mask cast/reshape are folded as
+// well and the raw f16 mask is read in-shader. Every node still exists for the unfused
+// fallback (small k) and for the other backends.
+static constexpr std::initializer_list<ggml_op> topk_qsa_pattern { GGML_OP_CONT,     GGML_OP_GET_ROWS,
+                                                                   GGML_OP_PERMUTE,  GGML_OP_CONT,
+                                                                   GGML_OP_CPY,      GGML_OP_RESHAPE,
+                                                                   GGML_OP_ADD,      GGML_OP_TOP_K };
 static constexpr std::initializer_list<std::array<int, 3>> topk_qsa_edges {
-    { 1, 0, 0 }, // permute->src[0] == get_rows
-    { 2, 0, 1 }, // cont->src[0]    == permute
-    { 4, 0, 3 }, // reshape->src[0] == cpy (mask cast)
-    { 5, 0, 2 }, // add->src[0]     == cont
-    { 5, 1, 4 }, // add->src[1]     == reshape
-    { 6, 0, 5 }, // top_k->src[0]   == add
+    { 1, 0, 0 }, // get_rows->src[0] == the transpose of the block score
+    { 2, 0, 1 }, // permute->src[0]  == get_rows
+    { 3, 0, 2 }, // cont->src[0]     == permute
+    { 5, 0, 4 }, // reshape->src[0]  == cpy (mask cast)
+    { 6, 0, 3 }, // add->src[0]      == post-gather cont
+    { 6, 1, 5 }, // add->src[1]      == reshape
+    { 7, 0, 6 }, // top_k->src[0]    == add
 };
 
 //node #978 (  SOFT_MAX):     ffn_moe_probs-15 (   0K) [Vulka         ] use=2:    ffn_moe_logits-15 (   0K) [Vulka         ]
@@ -16336,13 +16342,19 @@ static void ggml_vk_topk(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ctx->prealloc_x_need_sync = true;
 }
 
+static bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool elementwise);
+static bool ggml_backend_buffer_is_vk(ggml_backend_buffer_t buffer);
+
 static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
-    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * pre_cont = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 1];
     const ggml_tensor * add      = cgraph->nodes[node_idx + ctx->num_additional_fused_ops - 1];
     ggml_tensor *       top_k    = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
 
-    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
-    const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
+    // the transpose in front of the gather is folded away, so the kernel reads the block score
+    // in its native layout: the shape comes from the transpose dst, the storage from its src
+    const ggml_tensor * scores   = pre_cont->src[0]->src[0]; // [n_blocks, n_tps, n_stream]
+    const ggml_tensor * cell_blk = get_rows->src[1];         // [n_kv, n_stream]
 
     // raw f16 mask: follow the reshape/cpy chain back to the materialized input
     const ggml_tensor * mask = add->src[1];
@@ -16350,9 +16362,9 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         mask = mask->src[0];
     }
 
-    const uint32_t n_tps    = scores->ne[0];
-    const uint32_t n_blocks = scores->ne[1];
-    const uint32_t n_stream = scores->ne[2];
+    const uint32_t n_tps    = pre_cont->ne[0];
+    const uint32_t n_blocks = pre_cont->ne[1];
+    const uint32_t n_stream = pre_cont->ne[2];
     const uint32_t n_kv     = cell_blk->ne[0];
     const uint32_t width    = top_k->ne[0];
     const uint32_t nrows    = n_tps * n_stream;
@@ -16360,10 +16372,42 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_pipeline pipeline = ctx->device->pipeline_topk_radix_qsa;
     GGML_ASSERT(pipeline != nullptr);
 
-    // scratch holds the gathered+masked input, materialized once and reused across passes
-    const size_t scratch_size = size_t{ n_kv } * nrows * sizeof(float);
-    if (ctx->prealloc_size_x < scratch_size) {
-        ctx->prealloc_size_x = scratch_size;
+    // The kernel reads the block score and writes cell indices, and ggml-alloc does place the
+    // output in the memory of the block score, so with independently scheduled workgroups the
+    // kernel would overwrite cells it has not read yet. These three tensors are exactly what the
+    // kernel reads, so testing them against the output is the whole hazard: on a hit the indices
+    // go to private storage and a copy fills the real output after a barrier, on a miss the
+    // kernel writes the output directly and pays nothing for a case that cannot happen.
+    // The fusion guard is skipped for this fusion because this test asks the right question -
+    // what the kernel reads - while the guard asks about the pattern's elided intermediates,
+    // which this kernel never touches.
+    // Only a Vulkan buffer can be compared: ggml_vk_tensors_overlap reads the buffer context as
+    // its own, and the context of another buffer type is just its data pointer. Two distinct
+    // buffers never share storage, so a tensor outside a Vulkan buffer can only alias the output
+    // by sitting in the very same buffer - which is still an overlap, and goes private.
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        if (a->buffer == nullptr || b->buffer == nullptr) {
+            return true;
+        }
+        if (!ggml_backend_buffer_is_vk(a->buffer) || !ggml_backend_buffer_is_vk(b->buffer)) {
+            return a->buffer == b->buffer;
+        }
+        return ggml_vk_tensors_overlap(a, b, false);
+    };
+    bool private_out = overlaps(scores, top_k) || overlaps(cell_blk, top_k) || overlaps(mask, top_k);
+    // Whether the allocator overlaps the two is a property of the graph, so no test case reaches
+    // the private route on its own and the guard exemption below would be untested. This admits
+    // it without the overlap, which can only cost a copy.
+    static const char * priv_env   = getenv("GGML_VK_QSA_PRIV_FORCE");
+    static const bool   priv_force = priv_env && priv_env[0] != '\0' && priv_env[0] != '0';
+    private_out = private_out || priv_force;
+
+    // a descriptor offset must be a multiple of minStorageBufferOffsetAlignment
+    const size_t scratch_size = GGML_PAD(size_t{ n_kv } * nrows * sizeof(float),
+                                         ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    const size_t out_size     = private_out ? size_t{ width } * nrows * sizeof(int32_t) : 0;
+    if (ctx->prealloc_size_x < scratch_size + out_size) {
+        ctx->prealloc_size_x = scratch_size + out_size;
         ggml_vk_preallocate_buffers(ctx, subctx);
     }
     if (ctx->prealloc_x_need_sync) {
@@ -16376,12 +16420,35 @@ static void ggml_vk_topk_qsa(ggml_backend_vk_context * ctx, vk_context& subctx, 
         std::min(nrows, ctx->device->properties.limits.maxComputeWorkGroupCount[1]),
         1,
     };
-    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, ctx->prealloc_x->size };
+    vk_subbuffer scratch_buf { ctx->prealloc_x, 0, scratch_size };
+    vk_subbuffer out_buf     = private_out ? vk_subbuffer{ ctx->prealloc_x, scratch_size, out_size }
+                                           : ggml_vk_tensor_subbuffer(ctx, top_k);
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        { ggml_vk_tensor_subbuffer(ctx, scores), ggml_vk_tensor_subbuffer(ctx, top_k),
+        { ggml_vk_tensor_subbuffer(ctx, scores), out_buf,
           ggml_vk_tensor_subbuffer(ctx, cell_blk), ggml_vk_tensor_subbuffer(ctx, mask),
           scratch_buf }, pc, elements);
+
+    if (private_out) {
+        // shader write -> transfer read
+        ggml_vk_sync_buffers(ctx, subctx);
+
+        // ggml_vk_tensor_subbuffer rounds the offset down and grows the range for shader
+        // addressing, which a straight buffer copy must not do: use the exact offset
+        vk_buffer dst_buf = nullptr;
+        size_t    dst_off = 0;
+        if (ctx->device->uma) {
+            ggml_vk_host_get(ctx->device, top_k->data, dst_buf, dst_off);
+        }
+        if (!dst_buf) {
+            auto dst_buf_ctx = (ggml_backend_vk_buffer_context *) top_k->buffer->context;
+            dst_buf = dst_buf_ctx->dev_buffer;
+            dst_off = vk_tensor_offset(top_k) + top_k->view_offs;
+        }
+        GGML_ASSERT(dst_buf != nullptr);
+        ggml_vk_buffer_copy_async(subctx, dst_buf, dst_off, ctx->prealloc_x, scratch_size, out_size);
+    }
+
     ctx->prealloc_x_need_sync = true;
 }
 
@@ -17949,11 +18016,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
     case GGML_OP_GET_ROWS:
-        if (ctx->fused_topk_qsa) {
-            ggml_vk_topk_qsa(ctx, compute_ctx, cgraph, node_idx);
-        } else {
-            ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
-        }
+        ggml_vk_get_rows(ctx, compute_ctx, src0, src1, node);
 
         break;
     case GGML_OP_GET_ROWS_BACK:
@@ -18057,7 +18120,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
-        ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        if (ctx->fused_topk_qsa) {
+            ggml_vk_topk_qsa(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_cpy(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_SET_ROWS:
@@ -19472,13 +19539,28 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
         }
     }
 
-    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * pre_cont = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * get_rows = cgraph->nodes[node_idx + 1];
     const ggml_tensor * add      = cgraph->nodes[node_idx + n_ops - 2];
     const ggml_tensor * top_k    = cgraph->nodes[node_idx + n_ops - 1];
 
-    const ggml_tensor * scores   = get_rows->src[0]; // [n_tps, n_blocks, n_stream]
+    // the kernel reads the score through the transpose it folds away: same values, addressed
+    // by block instead of by token. Only that exact (1,0,2,3) transpose is transparent.
+    const ggml_tensor * permute  = pre_cont->src[0];
+    const ggml_tensor * scores   = permute->src[0];  // [n_blocks, n_tps, n_stream]
     const ggml_tensor * cell_blk = get_rows->src[1]; // [n_kv, n_stream]
     const ggml_tensor * expanded = add->src[0];      // [n_kv, n_tps, n_stream]
+
+    if (permute == nullptr || permute->op != GGML_OP_PERMUTE || scores == nullptr ||
+        ggml_get_op_params_i32(permute, 0) != 1 || ggml_get_op_params_i32(permute, 1) != 0 ||
+        ggml_get_op_params_i32(permute, 2) != 2 || ggml_get_op_params_i32(permute, 3) != 3) {
+        return false;
+    }
+    if (scores->ne[3] != 1 || !ggml_is_contiguous(scores) ||
+        scores->ne[0] != pre_cont->ne[1] || scores->ne[1] != pre_cont->ne[0] ||
+        scores->ne[2] != pre_cont->ne[2]) {
+        return false;
+    }
 
     // raw mask: follow the reshape/cpy chain back to the materialized f16 input
     const ggml_tensor * mask = add->src[1];
@@ -19497,14 +19579,15 @@ static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struc
         return false;
     }
 
-    const int64_t n_tps    = scores->ne[0];
-    const int64_t n_blocks = scores->ne[1];
-    const int64_t n_stream = scores->ne[2];
+    const int64_t n_tps    = pre_cont->ne[0];
+    const int64_t n_blocks = pre_cont->ne[1];
+    const int64_t n_stream = pre_cont->ne[2];
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t width    = top_k->ne[0];
 
     // pin the indexer layout the shader's addressing assumes
-    if (scores->ne[3] != 1 || cell_blk->ne[1] != n_stream || ggml_nrows(cell_blk) != n_stream ||
+    if (!ggml_is_contiguous(pre_cont) || pre_cont->ne[3] != 1 ||
+        cell_blk->ne[1] != n_stream || ggml_nrows(cell_blk) != n_stream ||
         ggml_nelements(mask) != n_kv * n_tps * n_stream ||
         expanded->ne[0] != n_kv || expanded->ne[1] != n_tps || expanded->ne[2] != n_stream ||
         top_k->ne[1] != n_tps || top_k->ne[2] != n_stream || top_k->ne[3] != 1 ||
@@ -20085,10 +20168,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // topk_moe often overwrites the source, but for a given row all the src values are
             // loaded before anything is stored. If there's only one row, this is safe, so treat
             // this as a special case.
-            bool is_topk_moe_single_row = ctx->fused_topk_moe_mode != TOPK_MOE_COUNT &&
-                                          ggml_nrows(cgraph->nodes[i]->src[0]) == 1;
+            // The fused QSA top-k routes its output into private storage whenever a tensor it
+            // reads overlaps it, so it never writes memory it still has to read and the reason
+            // this guard exists does not apply to it.
+            const bool overlap_safe = (ctx->fused_topk_moe_mode != TOPK_MOE_COUNT &&
+                                       ggml_nrows(cgraph->nodes[i]->src[0]) == 1) ||
+                                      ctx->fused_topk_qsa;
 
-            if (!is_topk_moe_single_row) {
+            if (!overlap_safe) {
                 for (int j = 0; j < 2; ++j) {
                     ggml_tensor *dst = output_nodes[j];
                     if (!dst) {

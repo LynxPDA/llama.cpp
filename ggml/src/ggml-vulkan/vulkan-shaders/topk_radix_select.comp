@@ -41,6 +41,8 @@ shared uint sh_above;
 shared uint sg_cnt_gt[64]; // per-subgroup strictly-above counts for the slot scan
 shared uint sg_cnt_eq[64]; // per-subgroup tie counts for the slot scan
 
+#define NEG_INF (uintBitsToFloat(0xFF800000u))
+
 // order-preserving float -> uint mapping
 uint f2ui(float x) {
     uint y = floatBitsToUint(x);
@@ -53,13 +55,19 @@ uint f2ui(float x) {
 }
 
 // QSA element i of row (t,s): score[cell_blk[i,s], t, s] + mask[i,t,s]
+// the score is read in its native block-major layout, so consecutive cells of a block (which
+// is what cell_blk yields in runs) walk consecutive addresses
 float gather(uint row, uint i) {
     const uint t = row % p.n_tps;
     const uint s = row / p.n_tps;
-    const uint block = uint(cell_blk[s * p.ncols + i]);
-    const float a = data_a[(s * p.n_blocks + block) * p.n_tps + t];
     const float m = float(mask[(s * p.n_tps + t) * p.ncols + i]);
-    return a + m;
+    // a masked cell sums to exactly -inf whatever the block index is, so the score read and
+    // the block lookup can be skipped: the block may not cover this cell at all
+    if (m == NEG_INF) {
+        return NEG_INF;
+    }
+    const uint block = uint(cell_blk[s * p.ncols + i]);
+    return data_a[(s * p.n_tps + t) * p.n_blocks + block] + m;
 }
 
 float load(uint row, uint i, bool first) {
