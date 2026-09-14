@@ -6237,6 +6237,7 @@ struct test_topk_qsa : public test_case {
     const int64_t n_tps;
     const int64_t n_stream;
     const int     width;
+    const bool    degenerate; // equal scores, few distinct mask values and masked cells
     ggml_tensor * out {};
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6245,11 +6246,11 @@ struct test_topk_qsa : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width);
+        return VARS_TO_STR6(n_blocks, n_kv, n_tps, n_stream, width, degenerate);
     }
 
-    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500, bool degenerate = false)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), degenerate(degenerate) {}
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -6274,7 +6275,9 @@ struct test_topk_qsa : public test_case {
 
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
-    // distinct mask ramp + small scores keep every cell value unique, so no top-k ties
+    // distinct mask ramp + small scores keep every cell value unique, so no top-k ties.
+    // The degenerate variant instead floods every row with ties and masked cells: the
+    // threshold then has to be filled from equal values.
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE) {
@@ -6288,12 +6291,18 @@ struct test_topk_qsa : public test_case {
                 std::vector<ggml_fp16_t> data(ggml_nelements(t));
                 for (int64_t r = 0; r < ggml_nrows(t); r++) {
                     for (int64_t i = 0; i < n_kv; i++) {
-                        data[r * n_kv + i] = ggml_fp32_to_fp16((float) i);
+                        const bool  masked = degenerate && (i % 16 == 0);
+                        const float v      = degenerate ? (float) (i % 4) : (float) i;
+                        data[r * n_kv + i] = ggml_fp32_to_fp16(masked ? -INFINITY : v);
                     }
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
             } else {
                 init_tensor_uniform(t, 0.0f, 0.5f);
+                if (degenerate) {
+                    std::vector<float> data(ggml_nelements(t), 1.0f);
+                    ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+                }
             }
         }
     }
@@ -6307,7 +6316,34 @@ struct test_topk_qsa : public test_case {
             ib[i] = (int32_t) b[i];
             diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
         }
+        if (degenerate) {
+            // every row holds fewer finite values than the width, so the selection has to be
+            // filled from the masked -inf cells. Which of the tied cells each backend keeps is
+            // unspecified (the CPU sort is not stable), so compare the value multiset instead:
+            // it is unique and it changes if the masked cells lose their -inf value.
+            std::vector<float> va(n), vb(n);
+            for (size_t i = 0; i < n; i++) {
+                va[i] = value_of(ia[i]);
+                vb[i] = value_of(ib[i]);
+            }
+            std::sort(va.begin(), va.end());
+            std::sort(vb.begin(), vb.end());
+            double miss = 0.0;
+            for (size_t i = 0; i < n; i++) {
+                miss += (va[i] == vb[i]) ? 0.0 : 1.0;
+            }
+            return diff + miss;
+        }
         return diff + jdst(ia.data(), ib.data(), n);
+    }
+
+    // cell value produced by initialize_tensors for the degenerate data: uniform score plus
+    // a masking value, or exactly -inf inside a masked cell
+    float value_of(int32_t i) const {
+        if (i % 16 == 0) {
+            return -INFINITY;
+        }
+        return 1.0f + (float) (i % 4);
     }
 };
 
@@ -9959,6 +9995,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    // width 2000 over 1920 finite cells: the threshold falls into the masked -inf group
+    test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 2000, true)); // ties + masked cells
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
