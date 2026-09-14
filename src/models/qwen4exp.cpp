@@ -319,6 +319,15 @@ std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const 
 // The HIP backend (halo-box tree) fuses the stock chain instead (grouped inject/down matvec,
 // combine+norm kernel), so the default is on only when no CUDA/HIP device is in the model's
 // device list. LLAMA_HC_FASTPATH=1/0 forces it either way.
+// LLAMA_HC_NORM3D=0 restores the reshape-then-mul order of the hc norm (unfusable on Vulkan).
+static bool qwen4exp_hc_norm3d() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_NORM3D");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
     static const bool on = [&]() {
         if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
@@ -406,8 +415,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [hc_dim] gamma
     // the converter folded each gamma to (1 + w)
     ggml_tensor * xn = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
-    xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
-    xn = ggml_mul(ctx0, xn, w_norm);
+    if (qwen4exp_hc_norm3d()) {
+        // Apply gamma in the [n_embd, hc, nt] shape so the graph is RMS_NORM directly followed by MUL
+        // and the backend fuses them (Vulkan RMS_NORM_MUL); a RESHAPE node between the two blocks the
+        // pattern and costs a full 84 MB pass per mix at ub2048. The [hc_dim] gamma becomes an
+        // [n_embd, hc] view, expanded into the graph here so its RESHAPE node lands before the norm.
+        ggml_tensor * wn = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
+        ggml_build_forward_expand(gf, wn);
+        xn = ggml_mul(ctx0, xn, wn);
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+    } else {
+        xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+        xn = ggml_mul(ctx0, xn, w_norm);
+    }
     cb(xn, "hc_norm", il);
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
