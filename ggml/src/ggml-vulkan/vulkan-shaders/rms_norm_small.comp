@@ -1,0 +1,74 @@
+#version 450
+
+// RMS norm for SHORT rows (ne00 <= 256): one subgroup per row instead of a 512-thread workgroup
+// per row. rms_norm.comp spends 3/4 of its lanes idle on a 128-wide row and pays a shared-memory
+// reduction plus two barriers per row; on the Flash-Next GDN head norms ((128,48,2048) x 36 and
+// (128,16,2048) x 72 per graph) that was 1 ms per 50 MB, 4x under bandwidth (2026-09-14).
+// Same push constants, bindings and do_multiply semantics as rms_norm.comp (broadcast weight
+// through src1_idx / fastmod), contiguous destination. Rows are the flattened (i01, i02, i03).
+
+#include "generic_binary_head.glsl"
+#include "types.glsl"
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#define BLOCK_SIZE 256
+
+layout (constant_id = 1) const bool do_multiply = false;
+// second multiplier (RMS_NORM + MUL + MUL: the GDN gated norm, normalised * gamma * sigmoid(z)),
+// contiguous and the same shape as the destination, so it shares the destination index
+layout (constant_id = 2) const bool do_multiply2 = false;
+layout (binding = 3) readonly buffer C {float data_c[];};
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    const uint ncols = p.ne00;
+    const uint nrows = p.ne01 * p.ne02 * p.ne03;
+    const uint r     = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    if (r >= nrows) {
+        return;
+    }
+    const uint lane    = gl_SubgroupInvocationID;
+    const uint sgsize  = gl_SubgroupSize;
+    const uint row     = r % p.ne01;
+    const uint channel = (r / p.ne01) % p.ne02;
+    const uint samp    = r / (p.ne01 * p.ne02);
+
+    const uint a_offset = samp*p.nb03 + channel*p.nb02 + row*p.nb01 + get_aoffset();
+    const uint b_offset = src1_idx(0, row, channel, samp) + get_boffset();
+    const uint d_offset = ((samp*p.ne02 + channel)*p.ne01 + row)*ncols + get_doffset();
+
+    FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
+    for (uint col = lane; col < ncols; col += sgsize) {
+        const FLOAT_TYPE xi = FLOAT_TYPE(data_a[a_offset + col]);
+        sum += xi * xi;
+    }
+    sum = subgroupAdd(sum);
+
+    const FLOAT_TYPE mean  = sum / FLOAT_TYPE(ncols);
+    const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
+
+    if (do_multiply2) {
+        for (uint col = lane; col < ncols; col += sgsize) {
+            const FLOAT_TYPE g = FLOAT_TYPE(data_b[b_offset + (ncols > p.ne10 ? fastmod(col, p.ne10) : col)]);
+            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * g * FLOAT_TYPE(data_c[d_offset + col - get_doffset()]));
+        }
+    } else if (do_multiply) {
+        if (ncols > p.ne10) {
+            for (uint col = lane; col < ncols; col += sgsize) {
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)]));
+            }
+        } else {
+            for (uint col = lane; col < ncols; col += sgsize) {
+                data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col]));
+            }
+        }
+    } else {
+        for (uint col = lane; col < ncols; col += sgsize) {
+            data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+        }
+    }
+}

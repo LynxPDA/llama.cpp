@@ -328,6 +328,26 @@ static bool qwen4exp_hc_norm3d() {
     return on;
 }
 
+// LLAMA_HC_XN16=0 keeps the hc norm output in f32 (default: cast to f16 right after the norm; Vulkan
+// fuses RMS_NORM+MUL+CPY into one kernel and the two consumers, the down GEMM and the inject mat-vec,
+// take f16 B/A directly, so the GEMM's own 84 MB -> 42 MB conversion pass per mix disappears).
+static bool qwen4exp_hc_xn16() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_XN16");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
+// LLAMA_HC_MIXOP=0 restores the unfused mix collapse (sigmoid, mul, hc-1 adds, scale).
+static bool qwen4exp_hc_mixop() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_HC_MIXOP");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 static bool qwen4exp_hc_fastpath(const llama_model & model) {
     static const bool on = [&]() {
         if (const char * e = getenv("LLAMA_HC_FASTPATH")) {
@@ -423,6 +443,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor * wn = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
         ggml_build_forward_expand(gf, wn);
         xn = ggml_mul(ctx0, xn, wn);
+        if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && loras->empty() && nt >= 32) {
+            // before the reshape: the cast must directly follow the MUL for the backend fusion.
+            // prefill only (nt >= 32): at decode the f16-B mat-vec paths are slower than the f32 ones
+            // and there is no conversion pass to save (2026-09-14: tg 27.2 -> 25.2 with the cast at N=1)
+            xn = ggml_cast(ctx0, xn, GGML_TYPE_F16);
+        }
         xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     } else {
         xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
@@ -432,28 +458,42 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     ggml_tensor * lo = build_lora_mm(w_down, xn);
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, build_lora_mm(w_up, lo));
-    cb(gate, "hc_gate", il);
+    ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
 
-    ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
-    gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+    ggml_tensor * mixed;
+    if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop()) {
+        // sigmoid gate, per-stream product and the mean over streams in one pass (DSV4_HC_MIX):
+        // the unfused chain was five full-width passes per mix, 2.2 ms of 4.7 at ub2048
+        // f16 result at prefill: every consumer of the mixed stream is a matmul B operand (attention and
+        // GDN in-projections, indexer projections, MoE router and experts), so the GEMMs' own f32->f16
+        // conversion passes disappear and the write halves; f32 at decode (f16-B mat-vec paths are slower)
+        const ggml_type mix_type = (qwen4exp_hc_xn16() && nt >= 32) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        mixed = ggml_dsv4_hc_mix(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), gate_logits, 1.0f / (float) hc, mix_type);
+        cb(mixed, "hc_mixed", il);
+    } else {
+        ggml_tensor * gate = ggml_sigmoid(ctx0, gate_logits);
+        cb(gate, "hc_gate", il);
 
-    // collapse the streams by their mean
-    ggml_tensor * mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
-            ggml_row_size(gated->type, n_embd) * hc, 0);
-    if (!qwen4exp_hc_fastpath(model)) {
-        // ggml_add takes a strided src0 on every backend (the result is a fresh contiguous
-        // tensor), so this copy of one stream per mix was a full-width pass for nothing
-        mixed = ggml_cont(ctx0, mixed);
+        ggml_tensor * gated = ggml_mul(ctx0, xn, gate);
+        gated = ggml_reshape_3d(ctx0, gated, n_embd, hc, nt);
+
+        // collapse the streams by their mean
+        mixed = ggml_view_2d(ctx0, gated, n_embd, nt,
+                ggml_row_size(gated->type, n_embd) * hc, 0);
+        if (!qwen4exp_hc_fastpath(model)) {
+            // ggml_add takes a strided src0 on every backend (the result is a fresh contiguous
+            // tensor), so this copy of one stream per mix was a full-width pass for nothing
+            mixed = ggml_cont(ctx0, mixed);
+        }
+        for (int64_t c = 1; c < hc; ++c) {
+            ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
+                    ggml_row_size(gated->type, n_embd) * hc,
+                    ggml_row_size(gated->type, n_embd) * c);
+            mixed = ggml_add(ctx0, mixed, s);
+        }
+        mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
+        cb(mixed, "hc_mixed", il);
     }
-    for (int64_t c = 1; c < hc; ++c) {
-        ggml_tensor * s = ggml_view_2d(ctx0, gated, n_embd, nt,
-                ggml_row_size(gated->type, n_embd) * hc,
-                ggml_row_size(gated->type, n_embd) * c);
-        mixed = ggml_add(ctx0, mixed, s);
-    }
-    mixed = ggml_scale(ctx0, mixed, 1.0f / (float) hc);
-    cb(mixed, "hc_mixed", il);
 
     if (inject) {
         if (qwen4exp_hc_fastpath(model) && loras->empty()) {
@@ -654,9 +694,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
         ggml_tensor * weights,
         ggml_tensor * gate,
         int           layer) {
-    // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
-    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+    // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu.
+    // The sigmoid is expanded first so the graph reads RMS_NORM, MUL(gamma), MUL(gate) back to back
+    // and the Vulkan backend fuses the three (RMS_NORM_MUL_MUL) instead of a separate 50 MB pass.
     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
+    ggml_build_forward_expand(gf, gated);
+    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
 
     return ggml_mul(ctx0, normalized, gated);
 }
@@ -665,12 +708,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // the block count in steps of 256/ratio. The pooled-key window has to cover that jump.
 static constexpr uint32_t QSA_N_PAD_KV = 256;
 
+// Dense shortcut (LLAMA_QSA_DENSE_SHORTCUT=0 disables): when the cache holds no more cells than the
+// budget, the top-k selects EVERY cell and sparse attention is the dense causal attention, exactly.
+static bool qwen4exp_qsa_dense_shortcut() {
+    static const bool on = [] {
+        const char * e = getenv("LLAMA_QSA_DENSE_SHORTCUT");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    return on;
+}
+
 // QSA attends to a budget of whole blocks of compress_ratio tokens, each scored by one
 // mean-pooled indexer key, plus the incomplete tail. set_input resolves the cache layout.
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias, uint32_t top_k, bool shortcut) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), top_k(top_k), shortcut(shortcut) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
@@ -694,6 +747,8 @@ public:
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
+    const uint32_t top_k;
+    const bool     shortcut;   // built without cell_blk / bias: the dense shortcut was taken
 
     // the per-cell half of the bias is the attention mask, so only the per-block half is uploaded
     const bool blk_bias;
@@ -727,11 +782,17 @@ bool llama_model_qwen4exp::llm_graph_input_qsa::can_reuse(const llm_graph_params
 
     bool res = true;
     res &= k_idxs   != nullptr && k_idxs->buffer   != nullptr && k_idxs->ne[0]   == n_tokens;
-    res &= cell_blk != nullptr && cell_blk->buffer != nullptr && cell_blk->ne[0] == n_kv;
-    res &= cell_blk != nullptr && cell_blk->ne[1] == n_stream;
-    res &= bias     != nullptr && bias->buffer     != nullptr;
-    res &= bias     != nullptr && bias->ne[0] == (blk_bias ? n_blocks : n_kv);
-    res &= bias     != nullptr && bias->ne[1] == n_tokens/n_stream;
+    // a shortcut graph has no cell_blk / bias (nothing reads them); it can only be reused while the
+    // shortcut decision holds for the new n_kv, and a scoring graph only while it does not
+    const bool want_shortcut = qwen4exp_qsa_dense_shortcut() && n_kv <= (int64_t) top_k + (int64_t) ratio - 1;
+    res &= shortcut == want_shortcut;
+    if (!shortcut) {
+        res &= cell_blk != nullptr && cell_blk->buffer != nullptr && cell_blk->ne[0] == n_kv;
+        res &= cell_blk != nullptr && cell_blk->ne[1] == n_stream;
+        res &= bias     != nullptr && bias->buffer     != nullptr;
+        res &= bias     != nullptr && bias->ne[0] == (blk_bias ? n_blocks : n_kv);
+        res &= bias     != nullptr && bias->ne[1] == n_tokens/n_stream;
+    }
 
     // the window is sized from whether the pooled cache was valid when the graph was built,
     // so a graph built over a valid cache must not be reused after something dropped it
@@ -782,11 +843,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     // layer was paying it for byte-identical data: 12 scans per ubatch instead of one.
     llm_graph_input_qsa * inp = nullptr;
 
+    const bool shortcut = qwen4exp_qsa_dense_shortcut() && n_kv <= (int64_t) hparams.indexer_top_k + r - 1;
+
     const auto it = qsa_inps.find((uint32_t) r);
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, hparams.indexer_top_k, shortcut);
 
         // the pooled-key cache is addressed by block with no stream offset, so it serves a
         // single-stream cache only; everything else keeps recomputing every block inline.
@@ -797,11 +860,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         const bool use_pool = mem_pool != nullptr && mem_pool->get_n_stream() == 1;
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
-        qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        if (!shortcut) {
+            // the shortcut graph never reads these: an input no node reads gets no buffer from
+            // ggml-alloc, which would then fail can_reuse every token (graph rebuilt per token,
+            // -3.5 t/s decode, 2026-09-14) and write through a null pointer in set_input
+            qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
+            qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
-        ggml_set_input(qsa->cell_blk);
-        ggml_set_input(qsa->bias);
+            ggml_set_input(qsa->cell_blk);
+            ggml_set_input(qsa->bias);
+        }
 
         // ggml-alloc gives data only to tensors some node reads, so an input the graph has no
         // use for keeps data == nullptr and set_input then writes through a null pointer. With
@@ -896,6 +964,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         pooled = ggml_reshape_3d(ctx0, fresh, idx_dim, n_blocks, n_stream);
     }
     cb(pooled, "indexer_k", il);
+
+    // Dense shortcut: the top-k below would select EVERY cell (width == n_kv), so skip the scoring, the
+    // top-k and the mask rebuild and let the caller take the dense path; the indexer key cache and the
+    // pooled-key window above are still written, so later ubatches score against a complete history.
+    if (shortcut) {
+        return nullptr;
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -1573,10 +1648,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     // keep the last state_cols columns for the next ubatch
     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    ggml_tensor * tail;
+    if (x->ne[1] >= state_cols) {
+        // the tail is the last state_cols tokens of x itself; taking it from x rather than from
+        // conv_input leaves the concat with one consumer (the conv), which is what lets the Vulkan
+        // backend fuse CONCAT+SSM_CONV+SILU and never write the 84 MB transposed concat (2026-09-14)
+        tail = ggml_transpose(ctx0, ggml_view_3d(ctx0, x,
+                channels, state_cols, n_seqs,
+                x->nb[1], x->nb[2],
+                (x->ne[1] - state_cols) * x->nb[1]));
+    } else {
+        tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    }
 
     ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
             state_cols * channels, n_seqs,

@@ -112,7 +112,7 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * pool_idxs, ggml_tensor * pool_cells,
                        ggml_tensor * pool_pos, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, int64_t n_kv_ctx, int64_t n_ns_ctx) const;
 
 private:
     // forget seq_id (or, for seq_id < 0, everything) in every cache at once, so that a restore
