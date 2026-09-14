@@ -15499,8 +15499,11 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
 // Identity mixing only: the graph passes comb = repeat(eye input); the check keys on that shape.
 static bool ggml_vk_can_fuse_hc_post_norm(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     static const bool enabled = [] {
+        // opt-in (GGML_VK_FUSE_HC_POST_NORM=1): measured 2026-09-14 on Flash-Next keep-128 pp2048 over two
+        // interleaved launch pairs, the fused kernel is -1.2% at d0 (941/932 vs 948/948 off) and neutral at
+        // 16k / 32k. The separate DSV4_HC_POST and RMS_NORM_MUL_CPY passes are the faster form here.
         const char * e = getenv("GGML_VK_FUSE_HC_POST_NORM");
-        return e == nullptr || atoi(e) != 0;
+        return e != nullptr && atoi(e) != 0;
     }();
     if (!enabled || node_idx + 3 >= cgraph->n_nodes) {
         return false;
