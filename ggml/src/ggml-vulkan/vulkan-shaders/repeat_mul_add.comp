@@ -1,0 +1,43 @@
+#version 450
+
+// Fused broadcast repeat + multiply + add:
+//     dst[i0, ic, it] = residual[i0, ic, it] + b[i0, 0, it] * w[0, ic, it]
+// The repeat only ever widens ne1, so a thread owns one (i0, it) pair and walks the streams:
+// the broadcast operand is read once and the [ne0, ne1, nt] intermediate never exists.
+// Multiply before add, as the three unfused kernels do.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer BBuf { float data_b[]; };
+layout(binding = 1) readonly  buffer WBuf { float data_w[]; };
+layout(binding = 2) readonly  buffer RBuf { float data_r[]; };
+layout(binding = 3) writeonly buffer DBuf { float data_d[]; };
+
+layout(push_constant) uniform Parameters {
+    uint ne0;                      // dst->ne[0], the repeat width
+    uint n_w;                      // dst->ne[1], the number of streams
+    uint sb0, sb2;                 // b strides; b->ne[1] == 1 and b->ne[3] == 1
+    uint sw1, sw2;                 // w strides; w->ne[0] == 1 and w->ne[3] == 1
+    uint sr0, sr1, sr2;            // residual strides
+    uint sd0, sd1, sd2;            // dst strides
+} p;
+
+void main() {
+    const uint i0 = gl_GlobalInvocationID.x;
+    const uint it = gl_GlobalInvocationID.y;
+    if (i0 >= p.ne0) {
+        return;
+    }
+
+    // one discontiguous group per (i0, it): the only element the streams share
+    const float b = data_b[i0 * p.sb0 + it * p.sb2];
+
+    for (uint ic = 0; ic < p.n_w; ++ic) {
+        const float r = data_r[i0 * p.sr0 + ic * p.sr1 + it * p.sr2];
+        // precise: the unfused chain rounds the multiply and the add separately, and contracting
+        // them into one fma would change the result by an ulp
+        precise float m = b * data_w[ic * p.sw1 + it * p.sw2];
+        precise float s = r + m;
+        data_d[i0 * p.sd0 + ic * p.sd1 + it * p.sd2] = s;
+    }
+}

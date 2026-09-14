@@ -3835,6 +3835,83 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// REPEAT (broadcast along ne1) + MUL + ADD, fused into one pass.
+// This is the hyper-connection combine: dst[e, c, t] = res[e, c, t] + b[e, 0, t] * w[0, c, t].
+// `variant` selects a case the fusion must decline: the repeat result is read twice, the
+// weight is not broadcast, or the destination is not the add.
+struct test_repeat_mul_add : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne; // [n_embd, n_hc, n_tokens, 1]
+    const std::string variant;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "REPEAT_MUL_ADD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        // the fused kernel must reproduce the unfused rounding exactly (no fma contraction),
+        // so this keeps the default tight bound
+        return 1e-7;
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, variant);
+    }
+
+    test_repeat_mul_add(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = { 128, 4, 32, 1 },
+            std::string variant = "")
+        : type(type), ne(ne), variant(std::move(variant)) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = ne[0];
+        const int64_t n_hc   = ne[1];
+        const int64_t n_tok  = ne[2];
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type, n_embd, 1, n_tok);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, type, 1, n_hc, n_tok);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * r = ggml_new_tensor_3d(ctx, type, n_embd, n_hc, n_tok);
+        ggml_set_name(r, "r");
+
+        // the recorded pattern is a plain repeat of the middle dimension
+        ggml_tensor * rep = ggml_repeat_4d(ctx, b, n_embd, n_hc, n_tok, 1);
+        ggml_set_name(rep, "repeat");
+
+        if (variant == "w_not_broadcast") {
+            // w keeps the full ne0, so the multiply is shape-compatible but not a broadcast
+            // and the shader's weight indexing does not apply
+            w = ggml_new_tensor_2d(ctx, type, n_embd, n_hc * n_tok);
+            ggml_set_name(w, "w_wide");
+            w = ggml_reshape_3d(ctx, w, n_embd, n_hc, n_tok);
+            ggml_set_name(w, "w_wide");
+        }
+
+        ggml_tensor * m = ggml_mul(ctx, rep, w);
+        ggml_set_name(m, "mul");
+
+        if (variant == "repeat_reused") {
+            // a second consumer of the repeat must block the fusion
+            ggml_tensor * other = ggml_add(ctx, rep, r);
+            ggml_set_name(other, "other");
+            ggml_tensor * out = ggml_add(ctx, other, m);
+            ggml_set_name(out, "out");
+            return out;
+        }
+
+        ggml_tensor * out = ggml_add(ctx, r, m);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -8618,6 +8695,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "bcast"));
             test_cases.emplace_back(new test_unary_mul(op, type, { 128, 2, 2, 2 }, false, "packed", "reuse"));
         }
+    }
+
+    // fused repeat(broadcast ne1) + mul + add, the hyper-connection combine
+    for (ggml_type type : { GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_repeat_mul_add(type, { 128, 4, 32, 1 }));
+        test_cases.emplace_back(new test_repeat_mul_add(type, {   5, 7, 11, 1 }));   // primes
+        test_cases.emplace_back(new test_repeat_mul_add(type, {1025, 13,  3, 1 }));   // large prime, few tokens
+        test_cases.emplace_back(new test_repeat_mul_add(type, { 256, 16,  8, 1 }));   // widest stream group
+        test_cases.emplace_back(new test_repeat_mul_add(type, {  64,  2,  1, 1 }));   // single token
+        // must not fuse
+        test_cases.emplace_back(new test_repeat_mul_add(type, { 128, 4, 32, 1 }, "repeat_reused"));
+        test_cases.emplace_back(new test_repeat_mul_add(type, { 128, 4, 32, 1 }, "w_not_broadcast"));
     }
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b

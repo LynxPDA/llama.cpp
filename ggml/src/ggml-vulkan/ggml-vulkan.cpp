@@ -1128,6 +1128,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_repeat_mul_add_f32;
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1988,6 +1989,16 @@ struct vk_op_dsv4_hc_post_push_constants {
 };
 static_assert(sizeof(vk_op_dsv4_hc_post_push_constants) <= 128);
 
+// Broadcast repeat + multiply + add: dst[i0, ic, it] = residual[i0, ic, it] + b[i0, 0, it] * w[0, ic, it].
+struct vk_op_repeat_mul_add_push_constants {
+    uint32_t ne0, n_w;
+    uint32_t sb0, sb2;
+    uint32_t sw1, sw2;
+    uint32_t sr0, sr1, sr2;
+    uint32_t sd0, sd1, sd2;
+};
+static_assert(sizeof(vk_op_repeat_mul_add_push_constants) <= 128);
+
 // Shared bitmap capacity in flash_attn_union.comp: 12288 words = 393216 compressed rows.
 static constexpr uint32_t VK_FA_UNION_MAX_WORDS = 12288;
 
@@ -2633,6 +2644,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_moe_scale {};
     // QSA indexer gather+add+top_k fused into one radix-select
     bool fused_topk_qsa {};
+    // hyper-connection combine: broadcast repeat + multiply + add in one pass
+    bool fused_repeat_mul_add {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;
@@ -6699,6 +6712,9 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32,
         "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5,
         sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_repeat_mul_add_f32,
+        "repeat_mul_add_f32", repeat_mul_add_f32_len, repeat_mul_add_f32_data, "main", 4,
+        sizeof(vk_op_repeat_mul_add_push_constants), {256, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -15655,6 +15671,34 @@ static void ggml_vk_roll(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_ROLL, std::move(p));
 }
 
+static void ggml_vk_repeat_mul_add(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * repeat = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul    = cgraph->nodes[node_idx + 1];
+    ggml_tensor *       dst    = cgraph->nodes[node_idx + 2];
+
+    const ggml_tensor * b        = repeat->src[0];
+    const ggml_tensor * w        = mul->src[1];
+    const ggml_tensor * residual = dst->src[0];
+
+    vk_pipeline pipeline = ctx->device->pipeline_repeat_mul_add_f32;
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_op_repeat_mul_add_push_constants pc = {
+        (uint32_t) dst->ne[0],
+        (uint32_t) dst->ne[1],
+        (uint32_t) (b->nb[0] / sizeof(float)), (uint32_t) (b->nb[2] / sizeof(float)),
+        (uint32_t) (w->nb[1] / sizeof(float)), (uint32_t) (w->nb[2] / sizeof(float)),
+        (uint32_t) (residual->nb[0] / sizeof(float)), (uint32_t) (residual->nb[1] / sizeof(float)), (uint32_t) (residual->nb[2] / sizeof(float)),
+        (uint32_t) (dst->nb[0] / sizeof(float)), (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)),
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { ggml_vk_tensor_subbuffer(ctx, b), ggml_vk_tensor_subbuffer(ctx, w),
+          ggml_vk_tensor_subbuffer(ctx, residual), ggml_vk_tensor_subbuffer(ctx, dst) },
+        pc, { (uint32_t) dst->ne[0], (uint32_t) dst->ne[2], 1 });
+}
+
 static void ggml_vk_repeat(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst, ggml_nelements(dst));
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_REPEAT, std::move(p));
@@ -18074,7 +18118,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
     switch (node->op) {
     case GGML_OP_REPEAT:
-        ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        if (ctx->fused_repeat_mul_add) {
+            ggml_vk_repeat_mul_add(ctx, compute_ctx, cgraph, node_idx);
+        } else {
+            ggml_vk_repeat(ctx, compute_ctx, src0, node);
+        }
 
         break;
     case GGML_OP_REPEAT_BACK:
@@ -19589,6 +19637,77 @@ static bool ggml_vk_match_ops(const struct ggml_cgraph * cgraph, int node_idx,
     return true;
 }
 
+// True if the hyper-connection combine can be fused at node_idx (the repeat).
+// The pattern is repeat(b) * w + residual, where the repeat widens ne1 only and feeds the
+// multiply directly. Fusing skips materializing the repeated tensor, so the pass becomes
+// read b once and walk the streams, instead of two full round trips over [ne0, n_hc, nt].
+static bool ggml_vk_can_fuse_repeat_mul_add(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (ctx->device->disable_fusion || !ctx->device->pipeline_repeat_mul_add_f32) {
+        return false;
+    }
+
+    if (!ggml_vk_match_ops(cgraph, node_idx, { GGML_OP_REPEAT, GGML_OP_MUL, GGML_OP_ADD })) {
+        return false;
+    }
+
+    // Both elided nodes must be consumed by the pattern alone, otherwise dropping them would
+    // strand the other consumers. ggml_vk_match_ops does not check this (it accepts external
+    // reshape/cpy chains for topk_qsa), so it is checked here.
+    if (ggml_node_get_use_count(cgraph, node_idx + 0) != 1 ||
+        ggml_node_get_use_count(cgraph, node_idx + 1) != 1) {
+        return false;
+    }
+
+    const ggml_tensor * repeat = cgraph->nodes[node_idx + 0];
+    const ggml_tensor * mul    = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * add    = cgraph->nodes[node_idx + 2];
+
+    // The repeated operand must be the first multiply operand: the shader reads it once per
+    // (i0, it) pair and multiplies it by each stream, which only works on the broadcast side.
+    if (mul->src[0] != repeat || mul->src[1] == nullptr || add->src[1] != mul) {
+        return false;
+    }
+
+    const ggml_tensor * b        = repeat->src[0];
+    const ggml_tensor * w        = mul->src[1];
+    const ggml_tensor * residual = add->src[0];
+
+    // b is [ne0, 1, nt] and w is [1, n_hc, nt]: the repeat widens the stream dimension only
+    if (b->ne[1] != 1 || b->ne[3] != 1 || w->ne[0] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (repeat->ne[0] != b->ne[0] || repeat->ne[2] != b->ne[2] || repeat->ne[3] != 1) {
+        return false;
+    }
+    if (w->ne[1] != repeat->ne[1] || w->ne[2] != b->ne[2]) {
+        return false;
+    }
+    if (residual->ne[0] != b->ne[0] || residual->ne[1] != repeat->ne[1] ||
+        residual->ne[2] != b->ne[2] || residual->ne[3] != 1) {
+        return false;
+    }
+
+    // only shapes the stream walk is meant for: a small stream count and a real token axis
+    if (b->ne[2] < 1 || repeat->ne[1] < 2 || repeat->ne[1] > 16) {
+        return false;
+    }
+
+    // The shader indexes raw element offsets, so everything must be f32 and contiguous.
+    if (b->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+        add->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous(b) || !ggml_is_contiguous(w) || !ggml_is_contiguous(residual) ||
+        !ggml_is_contiguous(add)) {
+        return false;
+    }
+
+    return get_misalign_bytes(ctx, b) == 0 &&
+           get_misalign_bytes(ctx, w) == 0 &&
+           get_misalign_bytes(ctx, residual) == 0 &&
+           get_misalign_bytes(ctx, add) == 0;
+}
+
 // True if the qwen4 QSA indexer top-k can be fused at node_idx (the get_rows).
 static bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (ctx->device->disable_fusion || !ctx->device->pipeline_topk_radix_qsa) {
@@ -20065,6 +20184,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         ctx->fused_topk_qsa = false;
+        ctx->fused_repeat_mul_add = false;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -20157,6 +20277,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // with a data dependency on that register. The overlap check still
                 // rejects partial overlaps (different base or size).
                 std::fill_n(op_srcs_fused_elementwise, 5, true);
+            } else if (ggml_vk_can_fuse_repeat_mul_add(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 2;
+                ctx->fused_repeat_mul_add = true;
+                fusion_string = "REPEAT_MUL_ADD";
+                // Only the add's src may alias the output exactly, and that is safe: a thread reads
+                // residual[i0, ic, it] before writing the same index. The repeat broadcasts its
+                // src and the multiply reads w, so neither may be admitted that way.
+                op_srcs_fused_elementwise[0] = false;
+                op_srcs_fused_elementwise[1] = false;
+                op_srcs_fused_elementwise[2] = true;
             } else if (ggml_vk_can_fuse_topk_qsa(ctx, cgraph, i)) {
                 ctx->num_additional_fused_ops = topk_qsa_pattern.size() - 1;
                 ctx->fused_topk_qsa = true;
@@ -20283,6 +20413,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
                 ctx->fused_topk_moe_scale = false;
                 ctx->fused_topk_qsa = false;
+                ctx->fused_repeat_mul_add = false;
                 // the nodes run one by one now, so the perf logger must not report them under the
                 // fused name: a declined fusion used to look like a fused one that got slow
                 fusion_string = nullptr;
