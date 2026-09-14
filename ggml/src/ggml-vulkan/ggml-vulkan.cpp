@@ -14807,7 +14807,7 @@ static void ggml_vk_sub(ggml_backend_vk_context * ctx, vk_context& subctx, const
     });
 }
 
-static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int32_t src0_unary = 0) {
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = ggml_type_size(src1->type);
     const uint32_t dst_type_size = ggml_type_size(dst->type);
@@ -14818,7 +14818,7 @@ static void ggml_vk_mul(ggml_backend_vk_context * ctx, vk_context& subctx, const
         (uint32_t)src1->ne[0], (uint32_t)src1->ne[1], (uint32_t)src1->ne[2],(uint32_t)src1->ne[3], (uint32_t)src1->nb[0] / src1_type_size, (uint32_t)src1->nb[1] / src1_type_size, (uint32_t)src1->nb[2] / src1_type_size, (uint32_t)src1->nb[3] / src1_type_size,
         (uint32_t) dst->ne[0], (uint32_t) dst->ne[1], (uint32_t) dst->ne[2],(uint32_t) dst->ne[3], (uint32_t) dst->nb[0] /  dst_type_size, (uint32_t) dst->nb[1] /  dst_type_size, (uint32_t) dst->nb[2] /  dst_type_size, (uint32_t) dst->nb[3] /  dst_type_size,
         0,
-        0.0f, 0.0f, 0,
+        0.0f, 0.0f, src0_unary,
     });
 }
 
@@ -18017,6 +18017,13 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
             ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
             ggml_tensor * other = (mul->src[0] == node) ? mul->src[1] : mul->src[0];
 
+            // sigmoid(x)*y: the MUL kernel with the unary on src0 (mul is commutative and the
+            // fusion requires equal shapes, so operand order is free).
+            if (ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID) {
+                ggml_vk_mul(ctx, compute_ctx, node->src[0], other, mul, 1);
+                break;
+            }
+
             ggml_tensor fused = *mul;
             fused.op = GGML_OP_GLU;
             memset(fused.op_params, 0, sizeof(fused.op_params));
@@ -19058,14 +19065,24 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
     // path, so the silu result makes a full round trip through memory. That is the same shape
     // swiglu-split already computes in one pass, so route the pair to the existing GLU pipeline.
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL) {
-        static const char * env = getenv("GGML_VK_FUSE_UNARY_MUL");
-        if (!(env && atoi(env) != 0)) {
-            return false;
-        }
         const ggml_tensor * unary = cgraph->nodes[node_idx];
         const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
-
-        if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU) {
+        const ggml_unary_op uop = ggml_get_unary_op(unary);
+        if (uop == GGML_UNARY_OP_SILU) {
+            static const char * env = getenv("GGML_VK_FUSE_UNARY_MUL");
+            if (!(env && atoi(env) != 0)) {
+                return false;
+            }
+        } else if (uop == GGML_UNARY_OP_SIGMOID) {
+            // sigmoid(x)*y runs as the plain MUL kernel with the unary applied to src0 (param3),
+            // one pass instead of two: the hyper-connection gate mul on the [hc_dim, nt] streams
+            // (qwen4exp build_hc_mix) is 88 sigmoid passes over 84 MB per graph at ub2048.
+            // GGML_VK_FUSE_SIGMOID_MUL=0 disables.
+            static const char * env = getenv("GGML_VK_FUSE_SIGMOID_MUL");
+            if (env && atoi(env) == 0) {
+                return false;
+            }
+        } else {
             return false;
         }
         if (mul->src[0] != unary && mul->src[1] != unary) {
@@ -19867,7 +19884,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
-                fusion_string = "SILU_MUL";
+                fusion_string = (ggml_get_unary_op(cgraph->nodes[i]) == GGML_UNARY_OP_SIGMOID) ? "SIGMOID_MUL" : "SILU_MUL";
             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 4 }) &&
                        ggml_check_edges(cgraph, i, rms_norm_mul_rope_view_set_rows_edges) &&
                        ggml_vk_can_fuse_rms_norm_mul_rope(ctx, cgraph, i) &&

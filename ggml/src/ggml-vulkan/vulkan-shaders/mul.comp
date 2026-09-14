@@ -20,7 +20,15 @@ void main() {
         uint i00, i01, i02, i03;
         get_indices(idx, i00, i01, i02, i03);
 
-        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]) * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
+        FLOAT_TYPE a = FLOAT_TYPE(data_a[get_aoffset() + src0_idx(i00, i01, i02, i03)]);
+        // p.param3: unary applied to src0 before the product (fused UNARY -> MUL; 0 = none).
+        // Uniform branch, so it costs nothing on the plain MUL path.
+        if (p.param3 == 1) {
+            a = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-a));           // sigmoid
+        } else if (p.param3 == 2) {
+            a = a / (FLOAT_TYPE(1.0) + exp(-a));                          // silu
+        }
+        data_d[get_doffset() + dst_idx(i00, i01, i02, i03)] = D_TYPE(a * FLOAT_TYPE(data_b[get_boffset() + src1_idx(i00, i01, i02, i03)]));
 
         idx += num_threads;
     }
