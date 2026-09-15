@@ -4,7 +4,7 @@
 Two byte-level transforms make it small enough to sit on the GPU, where the Vulkan backend gathers it in-graph:
 
 1. `quant_ple.py <shard2-f16.gguf> <shard2-q4_0.gguf> [bytes/s]` requantises the table rows to Q4_0
-   (rows are 160 halves: k-quants need 256-multiples, Q4_0 is legal). ~13.4 GB out, one pass, throttled writes.
+   (rows are 160 halves: k-quants need 256-multiples, Q4_0 is legal). ~28.8 GB out (4.5 bpw of 102 GB f16), one pass, throttled writes.
 2. `split_ple_heads.py <shard2-q4_0.gguf> <shard2-q4_0-perhead.gguf> <shard1.gguf> [bytes/s]` splits the single
    tensor into one tensor per indexer head (`per_layer_token_embd.h{h}.weight`) using the head offsets in shard 1,
    so every buffer stays under the 4 GiB Vulkan allocation cap. Byte-range copy, no requantisation.

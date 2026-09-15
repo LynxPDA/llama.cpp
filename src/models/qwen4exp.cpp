@@ -1847,9 +1847,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    // heads lie slowest within a token either way, as the reference does
+    // heads lie slowest within a token either way, as the reference does.
+    // The host gather only applies to a host-resident table: with the table (or its per-head split)
+    // on a device buffer the rows are gathered in-graph, whatever LLAMA_PLE_HOST_GATHER says, so a
+    // GPU-resident table needs no env to be safe (the host path would read a device pointer).
+    const ggml_tensor * tbl0 = model.per_layer_tok_embd != nullptr ? model.per_layer_tok_embd
+                             : (model.per_layer_tok_embd_h.empty() ? nullptr : model.per_layer_tok_embd_h[0]);
+    const bool tbl_host = tbl0 != nullptr && tbl0->buffer != nullptr && ggml_backend_buffer_is_host(tbl0->buffer);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LLAMA_LOG_INFO("%s: PLE table is %s-resident: %s gather\n", __func__, tbl_host ? "host" : "device",
+                (ple_host_gather() && tbl_host) ? "host" : "in-graph");
+    }
     ggml_tensor * emb = nullptr;
-    if (ple_host_gather()) {
+    if (ple_host_gather() && tbl_host) {
         ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32,
                 hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb);
