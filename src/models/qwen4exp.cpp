@@ -344,6 +344,34 @@ static bool qwen4exp_hc_xn16() {
     return on;
 }
 
+// A bf16 weight cannot take an f16 B operand anywhere: ggml-vulkan's supports_op refuses the
+// bf16 x f16 pair outright ("we currently don't have a bf16 x f16 shader, or an fp16->bf16 copy
+// shader") and the CPU mul_mat converts its B operand from f32, so such a node gets NO backend and
+// ggml_backend_sched_split_graph aborts on it. The f16 mixed/normed streams below feed exactly the
+// matmuls listed in build_hc_mix, so if any of those weights is bf16 the whole layer keeps f32.
+// Reachable with a stock community file, not just a hand-built one: AnonimousA's Flash-Next
+// REAP-320 GGUF ships blk.N.indexer.{q,k}_proj.weight in bf16 (2026-09-15).
+// Model-wide rather than per-layer: build_hc_mix is also called for the MTP draft head with
+// il = -1 (it mixes with model.hc_head_*, not a layer's weights), so there is no layer to ask.
+// Answering once for the whole model is also the conservative direction - a file with bf16 in
+// only some layers keeps f32 everywhere rather than half the graph.
+static bool qwen4exp_takes_f16_b(const llama_model & model) {
+    for (const auto & layer : model.layers) {
+        const ggml_tensor * consumers[] = {
+            layer.index_q_proj, layer.index_k_proj,          // QSA indexer projections
+            layer.wqkv, layer.wqkv_gate, layer.wq, layer.wk, layer.wv,  // attention / GDN in-projections
+            layer.ffn_gate_inp,                              // MoE router
+            layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps,
+        };
+        for (const ggml_tensor * w : consumers) {
+            if (w != nullptr && w->type == GGML_TYPE_BF16) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // LLAMA_HC_GATE16=0 keeps the hc gate logits in f32 (default: the up-GEMM writes f16 and the mix reads f16;
 // needs the xn16 path, since the f16-gate mix kernel reads f16 xn and writes f16).
 static bool qwen4exp_hc_gate16() {
@@ -458,7 +486,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor * wn = ggml_reshape_2d(ctx0, w_norm, n_embd, hc);
         ggml_build_forward_expand(gf, wn);
         xn = ggml_mul(ctx0, xn, wn);
-        if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && loras->empty() && nt >= 32) {
+        if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && loras->empty() && nt >= 32 &&
+            qwen4exp_takes_f16_b(model)) {
             // before the reshape: the cast must directly follow the MUL for the backend fusion.
             // prefill only (nt >= 32): at decode the f16-B mat-vec paths are slower than the f32 ones
             // and there is no conversion pass to save (2026-09-14: tg 27.2 -> 25.2 with the cast at N=1)
@@ -475,6 +504,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
     ggml_tensor * gate_logits = build_lora_mm(w_up, lo);
     if (qwen4exp_hc_fastpath(model) && qwen4exp_hc_mixop() && qwen4exp_hc_xn16() && qwen4exp_hc_gate16() && loras->empty() && nt >= 32 &&
+        qwen4exp_takes_f16_b(model) &&
         w_up->buffer != nullptr && !ggml_backend_buffer_is_host(w_up->buffer)) {   // a CPU matmul cannot take the f16 gate downstream
         // f16 gate logits: the up-GEMM writes its result as f16 through the MUL_MAT+CPY(f16) fusion and
         // DSV4_HC_MIX reads the f16 gate; the 84 MB f32 gate tensor is neither written nor read (prefill only)
@@ -491,7 +521,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         // f16 result at prefill: every consumer of the mixed stream is a matmul B operand (attention and
         // GDN in-projections, indexer projections, MoE router and experts), so the GEMMs' own f32->f16
         // conversion passes disappear and the write halves; f32 at decode (f16-B mat-vec paths are slower)
-        const ggml_type mix_type = (qwen4exp_hc_xn16() && nt >= 32) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const ggml_type mix_type = (qwen4exp_hc_xn16() && nt >= 32 && qwen4exp_takes_f16_b(model))
+                                   ? GGML_TYPE_F16 : GGML_TYPE_F32;
         mixed = ggml_dsv4_hc_mix(ctx0, ggml_reshape_3d(ctx0, xn, n_embd, hc, nt), gate_logits, 1.0f / (float) hc, mix_type);
         cb(mixed, "hc_mixed", il);
     } else {

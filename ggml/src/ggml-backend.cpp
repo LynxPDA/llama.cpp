@@ -1280,6 +1280,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         for (int b = 0; b < sched->n_backends && *cur_backend_id == -1; b++) {
             ggml_backend_sched_set_if_supported(sched, node, b, cur_backend_id);
         }
+        if (*cur_backend_id == -1) {
+            // Name the node instead of asserting bare: "no backend supports this" is otherwise a
+            // bare abort with a stack trace that points at the scheduler, not at the operation or
+            // the tensor type that is actually unsupported, which costs a bisect to find.
+            GGML_LOG_ERROR("%s: no backend supports node %s (op %s, type %s)\n", __func__,
+                node->name, ggml_op_name(node->op), ggml_type_name(node->type));
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j]) {
+                    GGML_LOG_ERROR("%s:   src[%d] = %s (type %s)\n", __func__, j,
+                        node->src[j]->name, ggml_type_name(node->src[j]->type));
+                }
+            }
+            for (int b = 0; b < sched->n_backends; b++) {
+                GGML_LOG_ERROR("%s:   backend %d (%s) supports_op = %d\n", __func__, b,
+                    ggml_backend_name(sched->backends[b]),
+                    (int) ggml_backend_supports_op(sched->backends[b], node));
+            }
+        }
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
