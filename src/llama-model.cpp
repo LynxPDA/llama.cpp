@@ -1816,6 +1816,21 @@ void llama_model::prefetch_rows(const struct ggml_tensor * t, const int32_t * ro
     }
 }
 
+bool llama_model::direct_row_source(const struct ggml_tensor * t, int & fd, size_t & file_off) const {
+    if (pimpl->gather_ranges.empty() || t == nullptr || t->data == nullptr) {
+        return false;
+    }
+    for (const auto & r : pimpl->gather_ranges) {
+        if (r.tensor == t) {
+            const auto & m = pimpl->mappings[r.idx];
+            fd = m->direct_fd();
+            file_off = (size_t) ((const char *) t->data - (const char *) m->addr());
+            return fd >= 0;
+        }
+    }
+    return false;
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(

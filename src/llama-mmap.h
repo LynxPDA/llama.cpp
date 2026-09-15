@@ -64,6 +64,10 @@ struct llama_mmap {
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
                        const int32_t * rows, size_t n_rows) const;
 
+    // an O_DIRECT descriptor on the mapped file (opened lazily, owned by the mapping), or -1: lets a
+    // gather read scattered rows with pread() at NVMe queue depth instead of one page fault each
+    int direct_fd() const;
+
     static const bool SUPPORTED;
 
 private:

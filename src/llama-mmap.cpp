@@ -577,6 +577,20 @@ struct llama_mmap::impl {
         }
     }
 
+    int fd_direct = -2;   // -2 = not tried yet
+    int direct_fd() {
+#if defined(__linux__)
+        if (fd_direct == -2) {
+            char path[64];
+            snprintf(path, sizeof(path), "/proc/self/fd/%d", fd_advise);
+            fd_direct = open(path, O_RDONLY | O_DIRECT);
+        }
+        return fd_direct;
+#else
+        return -1;
+#endif
+    }
+
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
                        const int32_t * rows, size_t n_rows) const {
 #if defined(_POSIX_MAPPED_FILES)
@@ -646,6 +660,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        if (fd_direct >= 0) { close(fd_direct); }
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -711,6 +726,8 @@ struct llama_mmap::impl {
 
     // PrefetchVirtualMemory takes the whole set of ranges in one call, which is exactly the
     // batching this wants: the reads are issued together instead of one fault at a time.
+    int direct_fd() { return -1; }
+
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
                        const int32_t * rows, size_t n_rows) const {
 #if _WIN32_WINNT >= 0x602
@@ -777,6 +794,8 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 
+    int direct_fd() { return -1; }
+
     void prefetch_rows(const void * base, size_t stride, size_t row_size,
                        const int32_t * rows, size_t n_rows) const {
         GGML_UNUSED(base);
@@ -813,6 +832,8 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
 bool llama_mmap::contains(const void * ptr, size_t len) const { return pimpl->contains(ptr, len); }
+
+int llama_mmap::direct_fd() const { return pimpl->direct_fd(); }
 
 void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
                                const int32_t * rows, size_t n_rows) const {

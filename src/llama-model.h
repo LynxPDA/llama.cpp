@@ -785,6 +785,9 @@ struct llama_model {
     // a mapping. off, and for anything else (offloaded tensors, --load-mode none, non-POSIX
     // hosts), this is one empty-vector test.
     void prefetch_rows(const struct ggml_tensor * t, const int32_t * rows, size_t n_rows) const;
+    // for a gather table that lives in a lazily mapped range: an O_DIRECT fd on its file and the
+    // tensor's byte offset in that file, so rows can be pread() at queue depth. false if not mapped so.
+    bool direct_row_source(const struct ggml_tensor * t, int & fd, size_t & file_off) const;
 
     // tensors that stay host-resident and are read by sparse row gathers rather than streamed
     // once. under LLAMA_MMAP_RANDOM these get the random-access advice and the batched readahead

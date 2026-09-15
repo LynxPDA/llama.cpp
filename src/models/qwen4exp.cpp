@@ -1,3 +1,8 @@
+#include <sys/resource.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <thread>
 #include "models.h"
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
@@ -1588,6 +1593,11 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     // faults happen one at a time; queued here they are in flight before the graph even runs.
     const bool split = pmodel.per_layer_tok_embd == nullptr;
 
+    // LLAMA_PLE_DEBUG=1: time the three host-side phases of the gather (prefill ubatches only)
+    static const bool ple_dbg = getenv("LLAMA_PLE_DEBUG") != nullptr && atoi(getenv("LLAMA_PLE_DEBUG")) != 0;
+    const int64_t t_pf0 = ple_dbg ? ggml_time_us() : 0;
+    struct rusage ru0 = {}; if (ple_dbg) getrusage(RUSAGE_SELF, &ru0);
+
     // per-head tables take head-local ids in head-major order
     std::vector<int32_t> idx_h;
     if (split) {
@@ -1597,12 +1607,36 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
                 idx_h[h*n_tokens + i] = idx[i*n_heads + h] - (int32_t) hp.ple_head_offsets[h];
             }
         }
-        for (int64_t h = 0; h < n_heads; ++h) {
-            pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
-        }
-    } else {
-        pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
     }
+    // LLAMA_PLE_PREFETCH: how the scattered table rows reach the host gather. The table is far larger
+    // than RAM and a prompt's rows are effectively random, so every 2048-token ubatch is ~32k reads of
+    // one page each. 1 = one posix_madvise(WILLNEED) per row page then fault (measured 2026-09-15: the
+    // hints alone take 550-700 ms per ubatch, ~20 us of submission each, single-threaded), 0 = no hint,
+    // faults taken on the gather pool, 2 = the hint only for pages mincore() reports absent (no better:
+    // the probe costs the same syscall), 3 = pread() the row pages through an O_DIRECT descriptor from
+    // the pool, at NVMe queue depth. Measured 2026-09-15 on the Intel 660p: modes 1, 2 and 3 all take
+    // ~550 ms per 32k rows with 16, 32 or 64 threads = the drive's ~60k random-read IOPS, so the reads
+    // are the cost, not the syscalls; mode 1 stays the default because its pages stay in the page
+    // cache for the next prompt that hits the same rows, while O_DIRECT reads keep nothing.
+    static const int ple_prefetch = [] {
+        const char * e = getenv("LLAMA_PLE_PREFETCH");
+        return e ? atoi(e) : 1;
+    }();
+    if (ple_prefetch == 1 || (ple_prefetch >= 2 && !rows)) {
+        // modes 2/3 are handled inside the gather (it knows the row addresses); the in-graph get_rows
+        // path keeps the plain hint
+        if (ple_prefetch == 1 || rows) {
+            if (split) {
+                for (int64_t h = 0; h < n_heads; ++h) {
+                    pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
+                }
+            } else {
+                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+            }
+        }
+    }
+
+    const int64_t t_pf1 = ple_dbg ? ggml_time_us() : 0;
 
     if (rows) {
         const std::vector<int32_t> & src = split ? idx_h : idx;
@@ -1618,20 +1652,125 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
     const ggml_type_traits * traits = tbl0->type == GGML_TYPE_F32 ? nullptr : ggml_get_type_traits(tbl0->type);
     GGML_ASSERT(tbl0->type == GGML_TYPE_F32 || (traits->to_float && "PLE table type has no to_float"));
 
-    // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical
+    // get_rows dequantised to F32; keep that so the downstream matmuls are bit-identical.
+    // The rows are scattered over a mapping far larger than RAM: every row is its own page, so the
+    // copy is bound by faults, not bytes. Gather on a pool so the faults (minor when cached, disk
+    // reads when not) overlap; with mode 2 each thread first hints the pages mincore() says are
+    // absent, so a cold run still gets asynchronous readahead without paying the hint on warm pages.
     std::vector<float> vals((size_t) head_dim * idx.size());
-    for (size_t k = 0; k < idx.size(); ++k) {
-        const int64_t h = split ? (int64_t) (k % n_heads) : 0;
-        const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
-        const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
-        if (traits == nullptr) {
-            memcpy(vals.data() + k*head_dim, base + (size_t) row*row_sz, head_dim*sizeof(float));
-        } else {
-            traits->to_float(base + (size_t) row*row_sz, vals.data() + k*head_dim, head_dim);
+    const size_t n_rows_all = idx.size();
+    const int64_t page = (int64_t) sysconf(_SC_PAGESIZE);
+    // mode 3: an O_DIRECT descriptor + file offset per table tensor (falls back to mode 1 if the table
+    // is not a lazily mapped range, e.g. --tensor-read-lazy off)
+    const int64_t n_tbl = split ? n_heads : 1;
+    std::vector<int>    dfd(n_tbl, -1);
+    std::vector<size_t> doff(n_tbl, 0);
+    bool direct = ple_prefetch == 3;
+    if (direct) {
+        for (int64_t h = 0; h < n_tbl; ++h) {
+            const ggml_tensor * t = split ? pmodel.per_layer_tok_embd_h[h] : tbl0;
+            if (!pmodel.direct_row_source(t, dfd[h], doff[h])) { direct = false; break; }
+        }
+        if (!direct) {
+            static bool warned = false;
+            if (!warned) { warned = true; LLAMA_LOG_WARN("%s: PLE table is not a lazily mapped range, direct row reads unavailable: using the page hint\n", __func__); }
+            if (split) {
+                for (int64_t h = 0; h < n_heads; ++h) {
+                    pmodel.prefetch_rows(pmodel.per_layer_tok_embd_h[h], idx_h.data() + h*n_tokens, n_tokens);
+                }
+            } else {
+                pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
+            }
         }
     }
+    auto gather_range = [&](size_t k0, size_t k1) {
+        if (direct) {
+            // one or two 4 KiB pages per row through pread(); the pool gives the device its queue depth
+            const size_t bsz = 2 * (size_t) page + (size_t) page;
+            void * mem = nullptr;
+            if (posix_memalign(&mem, (size_t) page, bsz) != 0) { mem = nullptr; }
+            char * buf = (char *) mem;
+            for (size_t k = k0; k < k1; ++k) {
+                const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+                const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+                const size_t foff = doff[h] + (size_t) row * row_sz;
+                const size_t p0   = foff & ~((size_t) page - 1);
+                const size_t len  = ((foff + row_sz + (size_t) page - 1) & ~((size_t) page - 1)) - p0;
+                const char * src  = nullptr;
+                if (buf != nullptr) {
+                    ssize_t got = 0;
+                    while (got < (ssize_t) len) {
+                        const ssize_t r = pread(dfd[h], buf + got, len - got, (off_t) (p0 + got));
+                        if (r <= 0) { break; }
+                        got += r;
+                    }
+                    if (got >= (ssize_t) (foff - p0 + row_sz)) { src = buf + (foff - p0); }
+                }
+                if (src == nullptr) {
+                    // direct read failed: fall back to the mapping for this row
+                    const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
+                    src = base + (size_t) row * row_sz;
+                }
+                if (traits == nullptr) {
+                    memcpy(vals.data() + k*head_dim, src, head_dim*sizeof(float));
+                } else {
+                    traits->to_float(src, vals.data() + k*head_dim, head_dim);
+                }
+            }
+            free(mem);
+            return;
+        }
+        if (ple_prefetch == 2) {
+            unsigned char vec[2];
+            for (size_t k = k0; k < k1; ++k) {
+                const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+                const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
+                const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+                const char * p0 = base + (size_t) row*row_sz;
+                const uintptr_t a0 = ((uintptr_t) p0) & ~(uintptr_t)(page - 1);
+                const size_t len = ((uintptr_t) p0 + row_sz) - a0;
+                if (mincore((void *) a0, len, vec) == 0 && !(vec[0] & 1)) {
+                    posix_madvise((void *) a0, len, POSIX_MADV_WILLNEED);
+                }
+            }
+        }
+        for (size_t k = k0; k < k1; ++k) {
+            const int64_t h = split ? (int64_t) (k % n_heads) : 0;
+            const char * base = (const char *) (split ? pmodel.per_layer_tok_embd_h[h]->data : tbl0->data);
+            const int64_t row = split ? idx[k] - (int32_t) hp.ple_head_offsets[h] : idx[k];
+            if (traits == nullptr) {
+                memcpy(vals.data() + k*head_dim, base + (size_t) row*row_sz, head_dim*sizeof(float));
+            } else {
+                traits->to_float(base + (size_t) row*row_sz, vals.data() + k*head_dim, head_dim);
+            }
+        }
+    };
+    static const int ple_threads = [] {
+        const char * e = getenv("LLAMA_PLE_GATHER_THREADS");
+        const int hw = (int) std::thread::hardware_concurrency();
+        return e ? std::max(1, atoi(e)) : std::max(1, std::min(32, 2 * hw));
+    }();
+    if (ple_threads <= 1 || n_rows_all < 4096) {
+        gather_range(0, n_rows_all);
+    } else {
+        std::vector<std::thread> pool;
+        const size_t chunk = (n_rows_all + ple_threads - 1) / ple_threads;
+        for (int t = 0; t < ple_threads; ++t) {
+            const size_t k0 = (size_t) t * chunk, k1 = std::min(n_rows_all, k0 + chunk);
+            if (k0 < k1) pool.emplace_back(gather_range, k0, k1);
+        }
+        for (auto & th : pool) th.join();
+    }
 
+    const int64_t t_g1 = ple_dbg ? ggml_time_us() : 0;
     ggml_backend_tensor_set(emb, vals.data(), 0, vals.size()*sizeof(float));
+    if (ple_dbg && n_tokens >= 1024) {
+        const int64_t t_s1 = ggml_time_us();
+        struct rusage ru1 = {}; getrusage(RUSAGE_SELF, &ru1);
+        fprintf(stderr, "PLE_GATHER n_tokens=%lld rows=%zu prefetch=%.1f ms gather=%.1f ms upload=%.1f ms minflt=%ld majflt=%ld\n",
+                (long long) n_tokens, idx.size(), (t_pf1 - t_pf0) / 1e3, (t_g1 - t_pf1) / 1e3, (t_s1 - t_g1) / 1e3,
+                ru1.ru_minflt - ru0.ru_minflt, ru1.ru_majflt - ru0.ru_majflt);
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
