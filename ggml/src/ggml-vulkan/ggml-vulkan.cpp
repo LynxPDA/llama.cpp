@@ -954,6 +954,7 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_matmul_split_k_reduce;
     vk_pipeline pipeline_quantize_q8_1_x4;
+    vk_pipeline pipeline_mul_mm_smallm_bf16_f32;
 
     vk_pipeline pipeline_dequant[GGML_TYPE_COUNT];
     vk_pipeline pipeline_dequant_transpose[GGML_TYPE_COUNT]; // fused dequant+transpose for FA quant-KV
@@ -1337,6 +1338,14 @@ struct vk_mat_mat_push_constants {
     uint32_t k_split;
     uint32_t ne02; uint32_t ne12; uint32_t broadcast2; uint32_t broadcast3;
     uint32_t padded_N;
+};
+
+// small-M bf16 mul_mat: dst [m, n], m <= 8, one partial plane per k split
+struct vk_op_smallm_push_constants {
+    uint32_t m;
+    uint32_t n;
+    uint32_t k;
+    uint32_t k_per_split;
 };
 
 #define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
@@ -6157,6 +6166,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_get_rows_back_f32, "get_rows_back_f32", get_rows_back_f32_len, get_rows_back_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {256, 1, 1}, {}, 1, true);
 
     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mm_smallm_bf16_f32, "mul_mm_smallm_bf16_f32", mul_mm_smallm_bf16_f32_len, mul_mm_smallm_bf16_f32_data, "main", 3, sizeof(vk_op_smallm_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
 
     for (auto &it : device->pipeline_fa_mask_opt) {
@@ -10831,6 +10841,59 @@ static void ggml_vk_fwht(ggml_backend_vk_context * ctx, vk_context& subctx, cons
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src_buf, dst_buf }, pc, { workgroups_x, 1, 1 });
 }
 
+// Small-M bf16 mul_mat (m <= 8, large k): B is read once into shared tiles and the
+// k range is split across workgroups; mul_mat_split_k_reduce sums the planes.
+static void ggml_vk_mul_mat_smallm_bf16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const uint32_t m = (uint32_t)dst->ne[0];
+    const uint32_t n = (uint32_t)dst->ne[1];
+    const uint32_t k = (uint32_t)src0->ne[0];
+
+    // Total workgroups = ceil(n/64) * split_k: scale the split count so the GPU
+    // keeps ~256 workgroups busy regardless of how wide dst is.
+    const uint32_t n_blocks = CEIL_DIV(n, 64);
+    uint32_t split_k = std::min<uint32_t>(64, std::max<uint32_t>(1u, 256u / n_blocks));
+    split_k = std::min(split_k, ctx->device->properties.limits.maxComputeWorkGroupCount[1]);
+    const uint32_t k_per_split = CEIL_DIV(CEIL_DIV(k, split_k), 256) * 256;
+    split_k = CEIL_DIV(k, k_per_split);
+
+    const uint64_t plane_sz = (uint64_t)m * n * sizeof(float);
+    const uint64_t split_k_size = plane_sz * split_k;
+    // Huge n with tiny k would need a split-k scratch beyond the storage limit:
+    // decline instead of aborting (the generic mm path handles it fine).
+    if (split_k_size > ctx->device->properties.limits.maxStorageBufferRange) {
+        ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
+        return;
+    }
+    if (ctx->prealloc_size_split_k < split_k_size) {
+        // Mark oversize FIRST: ggml_vk_preallocate_buffers frees prealloc_split_k
+        // before reallocating it, and a later dispatch in this same submission
+        // could otherwise capture the stale (freed) buffer handle.
+        ctx->prealloc_size_split_k = split_k_size;
+        ctx->prealloc_split_k = nullptr;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_mul_mm_smallm_bf16_f32, 1);
+    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_matmul_split_k_reduce, 1);
+
+    if (ctx->prealloc_split_k_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+
+    const vk_op_smallm_push_constants pc = { m, n, k, k_per_split };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_mul_mm_smallm_bf16_f32,
+        { ggml_vk_tensor_subbuffer(ctx, src0), ggml_vk_tensor_subbuffer(ctx, src1),
+          vk_subbuffer{ ctx->prealloc_split_k, 0, split_k_size } },
+        pc, { CEIL_DIV(n, 64) * 256, split_k, 1 });
+    ggml_vk_sync_buffers(ctx, subctx);
+
+    const std::array<uint32_t, 2> pc2 = { (uint32_t)(m * n), split_k };
+    ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_matmul_split_k_reduce,
+        { vk_subbuffer{ ctx->prealloc_split_k, 0, split_k_size }, ggml_vk_tensor_subbuffer(ctx, dst, true) },
+        pc2, { m * n, 1, 1 });
+    ctx->prealloc_split_k_need_sync = true;
+}
+
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
     ggml_tensor * dst = cgraph->nodes[node_idx];
     ggml_tensor * src0 = dst->src[0];
@@ -10890,6 +10953,14 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
     } else if ((dst->ne[1] == 1 || (dst->ne[1] <= mul_mat_vec_max_cols && src1->ne[2] * src1->ne[3] == 1)) &&
                (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type))) {
         ggml_vk_mul_mat_vec_q_f16(ctx, subctx, cgraph, node_idx);
+    } else if (getenv("GGML_VK_SMALLM_DISABLE") == nullptr &&
+               src0->type == GGML_TYPE_BF16 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+               dst->type == GGML_TYPE_F32 && dst->ne[0] <= 8 && dst->ne[1] >= 64 &&
+               src0->ne[2] * src0->ne[3] == 1 && src1->ne[2] * src1->ne[3] == 1 &&
+               ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+               ggml_nbytes(src0) <= ctx->device->properties.limits.maxStorageBufferRange &&
+               ggml_nbytes(src1) <= ctx->device->properties.limits.maxStorageBufferRange) {
+        ggml_vk_mul_mat_smallm_bf16(ctx, subctx, src0, src1, dst);
     } else {
         ggml_vk_mul_mat_q_f16(ctx, subctx, src0, src1, dst, false);
     }
