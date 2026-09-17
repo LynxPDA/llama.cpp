@@ -1080,7 +1080,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // ggml-alloc assigns a buffer only to tensors some node reads. A hybrid graph whose
+    // recurrent side is unused (an empty recurrent set, e.g. an MTP draft context) leaves
+    // s_copy unallocated, and set_input must then skip it like any dead input.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1124,7 +1127,10 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // ggml-alloc assigns a buffer only to tensors some node reads. A hybrid graph whose
+    // recurrent side is unused (an empty recurrent set, e.g. an MTP draft context) leaves
+    // s_copy unallocated, and set_input must then skip it like any dead input.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
@@ -1198,7 +1204,10 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
-    if (inp_rs->s_copy) {
+    // ggml-alloc assigns a buffer only to tensors some node reads. A hybrid graph whose
+    // recurrent side is unused (an empty recurrent set, e.g. an MTP draft context) leaves
+    // s_copy unallocated, and set_input must then skip it like any dead input.
+    if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
         GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
         int32_t * data = (int32_t *) inp_rs->s_copy->data;
 
